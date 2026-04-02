@@ -54,9 +54,8 @@ class HardNetSegmentationHead(nn.Module):
             if old_layer.bias is not None:
                 new_layer.bias.data = old_layer.bias.data
             self.backbone.base[0].conv = new_layer
-        backbone_channels = getattr(self.backbone, "features", self.backbone.full_features[-1])
         self.head = ConvUpsample(
-            in_channels=backbone_channels,
+            in_channels=self.backbone.features,
             out_channels=out_channels,
             upsample_factors=(2, 2, 2, 2, 2),
         )

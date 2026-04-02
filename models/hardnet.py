@@ -162,21 +162,6 @@ class HarDNet(nn.Module):
             max_pool = False
             drop_rate = 0.05
 
-        if arch == 39:
-            self.features = 640
-            self.full_features = [48, 96, 320, 640, 1024]
-            self.list = [1, 4, 7, 10, 13]
-        elif arch == 68:
-            self.features = 1024
-            self.full_features = [64, 128, 320, 640, 1024]
-            self.list = [1, 4, 9, 12, 15]
-        elif arch == 85:
-            self.features = 1280
-            self.full_features = [96, 192, 320, 720, 1280]
-            self.list = [1, 4, 9, 14, 18]
-        else:
-            raise ValueError(f"Unsupported HarDNet arch={arch}. Expected 39, 68, or 85.")
-
         blks = len(n_layers)
         self.base = nn.ModuleList([])
 
@@ -248,6 +233,25 @@ class HarDNet(nn.Module):
 
             postfix = 'DS' if depth_wise else ''
             print('ImageNet pretrained weights for HarDNet%d%s is loaded' % (arch, postfix))
+            if arch == 39:
+                self.features = 640
+                # self.base = self.base[0:14]
+                self.base = self.base[0:11]
+            if arch == 68:
+                self.features = 1024
+                self.base = self.base[0:16]
+            if arch == 85:
+                self.features = 1280
+                self.base = self.base[0:19]
+            if arch == 39:
+                self.full_features = [48, 96, 320, 640, 1024]
+                self.list = [1, 4, 7, 10, 13]
+            if arch == 68:
+                self.full_features = [64, 128, 320, 640, 1024]
+                self.list = [1, 4, 9, 12, 15]
+            if arch == 85:
+                self.full_features = [96, 192, 320, 720, 1280]
+                self.list = [1, 4, 9, 14, 18]
 
     def forward(self, x):
         for inx, layer in enumerate(self.base):
@@ -272,5 +276,3 @@ class HarDNet(nn.Module):
                 x32 = x
                 if inx == len(self.base) - 1:
                     return x2, x4, x8, x16, x32
-
-

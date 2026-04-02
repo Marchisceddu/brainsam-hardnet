@@ -70,8 +70,6 @@ parser.add_argument('--img_path', type=str, required=False, default=r'',
 parser.add_argument('--label_path', type=str, required=False, default=r'',
                     help='(Legacy) Single label directory for auto 80/20 split')
 parser.add_argument('--model_checkpoint', type=str, required=False, default=r'')
-parser.add_argument('--hardnet_checkpoint', type=str, required=False, default=r'',
-                    help='Path to specialized HarDNet+SegHead weights for first stage.')
 
 # Separate train/val directories (recommended — no data leakage)
 parser.add_argument('--train_img_path', type=str, default='',
@@ -400,17 +398,13 @@ def main_worker(args):
         print(f"Use GPU: {args.gpu} for training")
 
     # ── Build model ──
-    model_kwargs = {
-        "num_classes": args.num_classes,
-        "checkpoint": args.model_checkpoint,
-        "img_size": args.img_size,
-        "iter_2stage": args.iter_2stage,
-        "input_channels": args.input_channels,
-    }
-    if "hardnet" in args.model_type:
-        model_kwargs["hardnet_checkpoint"] = args.hardnet_checkpoint
-
-    model = sam_feat_seg_model_registry[args.model_type](**model_kwargs)
+    model = sam_feat_seg_model_registry[args.model_type](
+        num_classes=args.num_classes,
+        checkpoint=args.model_checkpoint,
+        img_size=args.img_size,
+        iter_2stage=args.iter_2stage,
+        input_channels=args.input_channels,
+    )
     model.to(device)
 
     # freeze image_encoder

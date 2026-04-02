@@ -44,26 +44,23 @@ def _load_checkpoint_safely(model, checkpoint_path):
     skipped_shape = []
 
     for key, value in state_dict.items():
-        # Handle cases where checkpoint has 'module.' prefix (from DDP) but model doesn't.
-        clean_key = key.replace('module.', '') if key.startswith('module.') else key
-
-        if clean_key not in model_state:
+        if key not in model_state:
             continue
 
-        target = model_state[clean_key]
+        target = model_state[key]
         if value.shape == target.shape:
-            filtered_state[clean_key] = value
-            loaded_keys.append(clean_key)
+            filtered_state[key] = value
+            loaded_keys.append(key)
             continue
 
         # Special case: SAM patch embedding 3ch checkpoint -> 1ch model.
-        if clean_key == "image_encoder.patch_embed.proj.weight":
+        if key == "image_encoder.patch_embed.proj.weight":
             if value.ndim == 4 and target.ndim == 4 and value.shape[1] == 3 and target.shape[1] == 1 and value.shape[0] == target.shape[0]:
-                filtered_state[clean_key] = value.mean(dim=1, keepdim=True)
-                loaded_keys.append(clean_key)
+                filtered_state[key] = value.mean(dim=1, keepdim=True)
+                loaded_keys.append(key)
                 continue
 
-        skipped_shape.append((clean_key, tuple(value.shape), tuple(target.shape)))
+        skipped_shape.append((key, tuple(value.shape), tuple(target.shape)))
 
     model.load_state_dict(filtered_state, strict=False)
     print(f"load keys over! loaded={len(loaded_keys)} skipped_shape={len(skipped_shape)}")
@@ -133,7 +130,6 @@ def _build_feat_seg_model_hardnet(
     num_classes,
     input_channels=3,
     checkpoint=None,
-    hardnet_checkpoint=None,
 ):
     prompt_embed_dim = 256
     image_size = 1024
@@ -161,7 +157,7 @@ def _build_feat_seg_model_hardnet(
         image_encoder=image_encoder,
         hardnet_first_stage=HardNetSegmentationHead(
             arch=85,
-            pretrained=True if hardnet_checkpoint is None else False, # Don't load ImageNet if user provides custom
+            pretrained=True,
             in_channels=input_channels,
             backbone_input_size=512,
             prompt_size=256,
@@ -182,10 +178,6 @@ def _build_feat_seg_model_hardnet(
             first_p=False,
         ),
     )
-
-    if hardnet_checkpoint is not None:
-        print(f"Loading custom weights into HarDNet first stage from {hardnet_checkpoint}")
-        _load_checkpoint_safely(sam_seg.hardnet_first_stage, hardnet_checkpoint)
 
     if checkpoint is not None:
         _load_checkpoint_safely(sam_seg, checkpoint)
@@ -223,7 +215,7 @@ def build_sam_vit_l_seg_cnn(num_classes=2, checkpoint=None, img_size=320, iter_2
     )
 
 
-def build_sam_vit_l_hardnet_seg_cnn(num_classes=2, checkpoint=None, img_size=320, iter_2stage=1, input_channels=1, hardnet_checkpoint=None):
+def build_sam_vit_l_hardnet_seg_cnn(num_classes=2, checkpoint=None, img_size=320, iter_2stage=1, input_channels=1):
     return _build_feat_seg_model_hardnet(
         img_size=img_size,
         iter_2stage=iter_2stage,
@@ -234,11 +226,10 @@ def build_sam_vit_l_hardnet_seg_cnn(num_classes=2, checkpoint=None, img_size=320
         num_classes=num_classes,
         input_channels=input_channels,
         checkpoint=checkpoint,
-        hardnet_checkpoint=hardnet_checkpoint,
     )
 
 
-def build_sam_vit_b_hardnet_seg_cnn(num_classes=2, checkpoint=None, img_size=320, iter_2stage=1, input_channels=1, hardnet_checkpoint=None):
+def build_sam_vit_b_hardnet_seg_cnn(num_classes=2, checkpoint=None, img_size=320, iter_2stage=1, input_channels=1):
     return _build_feat_seg_model_hardnet(
         img_size=img_size,
         iter_2stage=iter_2stage,
@@ -249,11 +240,10 @@ def build_sam_vit_b_hardnet_seg_cnn(num_classes=2, checkpoint=None, img_size=320
         num_classes=num_classes,
         input_channels=input_channels,
         checkpoint=checkpoint,
-        hardnet_checkpoint=hardnet_checkpoint,
     )
 
 
-def build_sam_vit_h_hardnet_seg_cnn(num_classes=2, checkpoint=None, img_size=320, iter_2stage=1, input_channels=1, hardnet_checkpoint=None):
+def build_sam_vit_h_hardnet_seg_cnn(num_classes=2, checkpoint=None, img_size=320, iter_2stage=1, input_channels=1):
     return _build_feat_seg_model_hardnet(
         img_size=img_size,
         iter_2stage=iter_2stage,
@@ -264,7 +254,6 @@ def build_sam_vit_h_hardnet_seg_cnn(num_classes=2, checkpoint=None, img_size=320
         num_classes=num_classes,
         input_channels=input_channels,
         checkpoint=checkpoint,
-        hardnet_checkpoint=hardnet_checkpoint,
     )
 
 
