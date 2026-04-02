@@ -563,6 +563,12 @@ def main_worker(args):
                 warnings.warn("W&B requested but package 'wandb' is not installed. Disabling W&B logging.")
             else:
                 run_name = args.wandb_run_name if args.wandb_run_name else None
+                ### ELIMINARE ###
+                try:
+                    wandb.login(key="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")
+                except Exception as e:
+                    warnings.warn(f"W&B login failed: {e}")
+                ### --------- ###
                 wandb_run = wandb.init(
                     project=args.wandb_project,
                     entity=args.wandb_entity,
