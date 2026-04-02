@@ -1,0 +1,294 @@
+import torch
+
+from functools import partial
+
+from .SamFeatSeg import SamFeatSeg, SegDecoderCNN, UPromptCNN
+from .hardnet_segmentation_head import HardNetSegmentationHead
+from .hardnet_feat_seg import HardNetFeatSeg
+# from .sam_decoder import MaskDecoder
+from segment_anything.modeling import ImageEncoderViT, PromptEncoder,TwoWayTransformer
+
+
+def _adapt_sam_patch_embed_in_channels(image_encoder, input_channels):
+    if input_channels == 3:
+        return
+    if input_channels != 1:
+        raise ValueError(f"Unsupported input_channels={input_channels}. Use 1 or 3.")
+
+    old_proj = image_encoder.patch_embed.proj
+    new_proj = torch.nn.Conv2d(
+        1,
+        old_proj.out_channels,
+        kernel_size=old_proj.kernel_size,
+        stride=old_proj.stride,
+        padding=old_proj.padding,
+        bias=old_proj.bias is not None,
+    )
+    new_proj.weight.data = old_proj.weight.data.mean(dim=1, keepdim=True)
+    if old_proj.bias is not None:
+        new_proj.bias.data = old_proj.bias.data
+    image_encoder.patch_embed.proj = new_proj
+
+
+def _load_checkpoint_safely(model, checkpoint_path):
+    """Load only compatible checkpoint tensors; adapt SAM patch-embed 3->1 when needed."""
+    with open(checkpoint_path, "rb") as f:
+        state_dict = torch.load(f, weights_only=False)
+
+    if isinstance(state_dict, dict) and "state_dict" in state_dict and isinstance(state_dict["state_dict"], dict):
+        state_dict = state_dict["state_dict"]
+
+    model_state = model.state_dict()
+    filtered_state = {}
+    loaded_keys = []
+    skipped_shape = []
+
+    for key, value in state_dict.items():
+        # Handle cases where checkpoint has 'module.' prefix (from DDP) but model doesn't.
+        clean_key = key.replace('module.', '') if key.startswith('module.') else key
+
+        if clean_key not in model_state:
+            continue
+
+        target = model_state[clean_key]
+        if value.shape == target.shape:
+            filtered_state[clean_key] = value
+            loaded_keys.append(clean_key)
+            continue
+
+        # Special case: SAM patch embedding 3ch checkpoint -> 1ch model.
+        if clean_key == "image_encoder.patch_embed.proj.weight":
+            if value.ndim == 4 and target.ndim == 4 and value.shape[1] == 3 and target.shape[1] == 1 and value.shape[0] == target.shape[0]:
+                filtered_state[clean_key] = value.mean(dim=1, keepdim=True)
+                loaded_keys.append(clean_key)
+                continue
+
+        skipped_shape.append((clean_key, tuple(value.shape), tuple(target.shape)))
+
+    model.load_state_dict(filtered_state, strict=False)
+    print(f"load keys over! loaded={len(loaded_keys)} skipped_shape={len(skipped_shape)}")
+    if skipped_shape:
+        print("Skipped (shape mismatch) keys example:", skipped_shape[:5])
+
+
+def _build_feat_seg_model(
+    img_size,
+    iter_2stage,
+    encoder_embed_dim,
+    encoder_depth,
+    encoder_num_heads,
+    encoder_global_attn_indexes,
+    num_classes,
+    input_channels=3,
+    checkpoint=None,
+):
+    prompt_embed_dim = 256
+    image_size = 1024
+    vit_patch_size = 16
+    image_embedding_size = image_size // vit_patch_size
+    image_encoder = ImageEncoderViT(
+        depth=encoder_depth,
+        embed_dim=encoder_embed_dim,
+        img_size=image_size,
+        mlp_ratio=4,
+        norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
+        num_heads=encoder_num_heads,
+        patch_size=vit_patch_size,
+        qkv_bias=True,
+        use_rel_pos=True,
+        global_attn_indexes=encoder_global_attn_indexes,
+        window_size=14,
+        out_chans=prompt_embed_dim,
+    )
+    _adapt_sam_patch_embed_in_channels(image_encoder, input_channels)
+
+    sam_seg = SamFeatSeg(
+        iter_2stage=iter_2stage,
+        img_size=img_size,
+        image_encoder=image_encoder,
+        promptcnn_first=UPromptCNN(n_channels=input_channels),
+        seg_decoder_first=SegDecoderCNN(num_classes=num_classes, num_depth=4, p_channel=3, promptemd_channel=0, first_p=True),
+
+        prompt_encoder_end=PromptEncoder(
+            embed_dim=prompt_embed_dim,
+            image_embedding_size=(image_embedding_size, image_embedding_size),
+            input_image_size=(image_size, image_size),
+            mask_in_chans=16,
+        ),
+        seg_decoder_end=SegDecoderCNN(num_classes=num_classes, num_depth=4, p_channel=0, promptemd_channel=256, first_p=False),
+    )
+
+    if checkpoint is not None:
+        _load_checkpoint_safely(sam_seg, checkpoint)
+    return sam_seg
+
+
+def _build_feat_seg_model_hardnet(
+    img_size,
+    iter_2stage,
+    encoder_embed_dim,
+    encoder_depth,
+    encoder_num_heads,
+    encoder_global_attn_indexes,
+    num_classes,
+    input_channels=3,
+    checkpoint=None,
+    hardnet_checkpoint=None,
+):
+    prompt_embed_dim = 256
+    image_size = 1024
+    vit_patch_size = 16
+    image_embedding_size = image_size // vit_patch_size
+    image_encoder = ImageEncoderViT(
+        depth=encoder_depth,
+        embed_dim=encoder_embed_dim,
+        img_size=image_size,
+        mlp_ratio=4,
+        norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
+        num_heads=encoder_num_heads,
+        patch_size=vit_patch_size,
+        qkv_bias=True,
+        use_rel_pos=True,
+        global_attn_indexes=encoder_global_attn_indexes,
+        window_size=14,
+        out_chans=prompt_embed_dim,
+    )
+    _adapt_sam_patch_embed_in_channels(image_encoder, input_channels)
+
+    sam_seg = HardNetFeatSeg(
+        iter_2stage=iter_2stage,
+        img_size=img_size,
+        image_encoder=image_encoder,
+        hardnet_first_stage=HardNetSegmentationHead(
+            arch=85,
+            pretrained=True if hardnet_checkpoint is None else False, # Don't load ImageNet if user provides custom
+            in_channels=input_channels,
+            backbone_input_size=512,
+            prompt_size=256,
+            out_channels=1,
+            freeze_backbone=False,
+        ),
+        prompt_encoder_end=PromptEncoder(
+            embed_dim=prompt_embed_dim,
+            image_embedding_size=(image_embedding_size, image_embedding_size),
+            input_image_size=(image_size, image_size),
+            mask_in_chans=16,
+        ),
+        seg_decoder_end=SegDecoderCNN(
+            num_classes=num_classes,
+            num_depth=4,
+            p_channel=0,
+            promptemd_channel=256,
+            first_p=False,
+        ),
+    )
+
+    if hardnet_checkpoint is not None:
+        print(f"Loading custom weights into HarDNet first stage from {hardnet_checkpoint}")
+        _load_checkpoint_safely(sam_seg.hardnet_first_stage, hardnet_checkpoint)
+
+    if checkpoint is not None:
+        _load_checkpoint_safely(sam_seg, checkpoint)
+    return sam_seg
+
+
+def build_sam_vit_h_seg_cnn(num_classes=2, checkpoint=None, img_size=320, iter_2stage=1, input_channels=3):
+    return _build_feat_seg_model(
+        img_size=img_size,
+        iter_2stage=iter_2stage,
+        encoder_embed_dim=1280,
+        encoder_depth=32,
+        encoder_num_heads=16,
+        encoder_global_attn_indexes=[7, 15, 23, 31],
+        num_classes=num_classes,
+        input_channels=input_channels,
+        checkpoint=checkpoint,
+    )
+
+
+build_sam_seg = build_sam_vit_h_seg_cnn
+
+
+def build_sam_vit_l_seg_cnn(num_classes=2, checkpoint=None, img_size=320, iter_2stage=1, input_channels=3):
+    return _build_feat_seg_model(
+        img_size=img_size,
+        iter_2stage=iter_2stage,
+        encoder_embed_dim=1024,
+        encoder_depth=24,
+        encoder_num_heads=16,
+        encoder_global_attn_indexes=[5, 11, 17, 23],
+        num_classes=num_classes,
+        input_channels=input_channels,
+        checkpoint=checkpoint,
+    )
+
+
+def build_sam_vit_l_hardnet_seg_cnn(num_classes=2, checkpoint=None, img_size=320, iter_2stage=1, input_channels=1, hardnet_checkpoint=None):
+    return _build_feat_seg_model_hardnet(
+        img_size=img_size,
+        iter_2stage=iter_2stage,
+        encoder_embed_dim=1024,
+        encoder_depth=24,
+        encoder_num_heads=16,
+        encoder_global_attn_indexes=[5, 11, 17, 23],
+        num_classes=num_classes,
+        input_channels=input_channels,
+        checkpoint=checkpoint,
+        hardnet_checkpoint=hardnet_checkpoint,
+    )
+
+
+def build_sam_vit_b_hardnet_seg_cnn(num_classes=2, checkpoint=None, img_size=320, iter_2stage=1, input_channels=1, hardnet_checkpoint=None):
+    return _build_feat_seg_model_hardnet(
+        img_size=img_size,
+        iter_2stage=iter_2stage,
+        encoder_embed_dim=768,
+        encoder_depth=12,
+        encoder_num_heads=12,
+        encoder_global_attn_indexes=[2, 5, 8, 11],
+        num_classes=num_classes,
+        input_channels=input_channels,
+        checkpoint=checkpoint,
+        hardnet_checkpoint=hardnet_checkpoint,
+    )
+
+
+def build_sam_vit_h_hardnet_seg_cnn(num_classes=2, checkpoint=None, img_size=320, iter_2stage=1, input_channels=1, hardnet_checkpoint=None):
+    return _build_feat_seg_model_hardnet(
+        img_size=img_size,
+        iter_2stage=iter_2stage,
+        encoder_embed_dim=1280,
+        encoder_depth=32,
+        encoder_num_heads=16,
+        encoder_global_attn_indexes=[7, 15, 23, 31],
+        num_classes=num_classes,
+        input_channels=input_channels,
+        checkpoint=checkpoint,
+        hardnet_checkpoint=hardnet_checkpoint,
+    )
+
+
+def build_sam_vit_b_seg_cnn(num_classes=2, checkpoint=None, img_size=320, iter_2stage=1, input_channels=3):
+    return _build_feat_seg_model(
+        img_size=img_size,
+        iter_2stage=iter_2stage,
+        encoder_embed_dim=768,
+        encoder_depth=12,
+        encoder_num_heads=12,
+        encoder_global_attn_indexes=[2, 5, 8, 11],
+        num_classes=num_classes,
+        input_channels=input_channels,
+        checkpoint=checkpoint,
+    )
+
+
+sam_feat_seg_model_registry = {
+    "default": build_sam_seg,
+    "vit_h": build_sam_seg,
+    "vit_l": build_sam_vit_l_seg_cnn,
+    "vit_h_hardnet": build_sam_vit_h_hardnet_seg_cnn,
+    "vit_l_hardnet": build_sam_vit_l_hardnet_seg_cnn,
+    "vit_b_hardnet": build_sam_vit_b_hardnet_seg_cnn,
+    "vit_b": build_sam_vit_b_seg_cnn,
+}
+
