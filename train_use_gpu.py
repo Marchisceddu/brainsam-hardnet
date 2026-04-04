@@ -5,6 +5,7 @@ import shutil
 import warnings
 import contextlib
 import re
+from types import SimpleNamespace
 from typing import Tuple, Dict
 import cv2
 import albumentations as albu
@@ -25,6 +26,7 @@ from monai.losses import DiceLoss, DiceCELoss
 from monai.metrics import DiceMetric
 from models import sam_feat_seg_model_registry
 from train_dataset import Dataset, parse_volume_info
+from lora_layers import inject_lora_sam
 
 try:
     import wandb
@@ -127,6 +129,25 @@ parser.add_argument('--wandb_max_images', type=int, default=2,
 parser.add_argument('--use_tensorboard', action='store_true',
                 help='Enable TensorBoard logging (disabled by default to avoid TensorFlow startup warnings).')
 
+# LoRA only for the SAM ViT image encoder.
+parser.add_argument('--lora_vit', dest='lora_vit', action='store_true',
+                help='Enable LoRA adapters in the SAM ViT image encoder.')
+parser.add_argument('--no_lora_vit', dest='lora_vit', action='store_false',
+                help='Disable LoRA adapters in the SAM ViT image encoder.')
+parser.set_defaults(lora_vit=True)
+parser.add_argument('--lora_vit_targets', type=str, default='q,v,mlp1,mlp2',
+                help='Comma-separated LoRA targets for the ViT encoder. '
+                    'Supported values: q, k, v, out, mlp1, mlp2. '
+                    'Use q,v,mlp1,mlp2 by default.')
+parser.add_argument('--lora_r', type=int, default=8,
+                help='LoRA rank for the ViT encoder.')
+parser.add_argument('--lora_alpha', type=float, default=16.0,
+                help='LoRA alpha scaling for the ViT encoder.')
+parser.add_argument('--lora_dropout', type=float, default=0.0,
+                help='LoRA dropout for the ViT encoder.')
+parser.add_argument('--lora_bias', action='store_true',
+                help='Use bias in LoRA adapter projections.')
+
 
 # ──────────────────────────────────────────────
 #  Metrics
@@ -187,6 +208,70 @@ def _ensure_multiclass_logits(logits, num_classes):
         # Two-class equivalent logits from a binary logit.
         return torch.cat([-logits, logits], dim=1)
     return logits
+
+
+def _parse_vit_lora_targets(targets: str) -> Dict[str, bool]:
+    """Translate CLI target aliases into the keys expected by lora_layers.py."""
+    alias_to_key = {
+        'q': 'q_proj',
+        'q_proj': 'q_proj',
+        'k': 'k_proj',
+        'k_proj': 'k_proj',
+        'v': 'v_proj',
+        'v_proj': 'v_proj',
+        'out': 'out_proj',
+        'proj': 'out_proj',
+        'out_proj': 'out_proj',
+        'mlp1': 'mlp_lin1',
+        'mlp_lin1': 'mlp_lin1',
+        'mlp2': 'mlp_lin2',
+        'mlp_lin2': 'mlp_lin2',
+        'all': 'all',
+    }
+    supported_keys = ['q_proj', 'k_proj', 'v_proj', 'out_proj', 'mlp_lin1', 'mlp_lin2']
+    selected = set()
+
+    for token in (part.strip().lower() for part in targets.split(',')):
+        if not token:
+            continue
+        if token not in alias_to_key:
+            raise ValueError(
+                f"Unknown LoRA target '{token}'. Supported values: q, k, v, out, mlp1, mlp2, all."
+            )
+        mapped = alias_to_key[token]
+        if mapped == 'all':
+            selected.update(supported_keys)
+        else:
+            selected.add(mapped)
+
+    if not selected:
+        raise ValueError("At least one LoRA target must be selected.")
+
+    return {key: key in selected for key in supported_keys}
+
+
+def _build_vit_lora_cfg(args):
+    """Build the minimal config object expected by inject_lora_sam()."""
+    encoder_targets = _parse_vit_lora_targets(args.lora_vit_targets)
+
+    return SimpleNamespace(
+        encoder=SimpleNamespace(
+            enabled=args.lora_vit,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            lora_bias=args.lora_bias,
+            lora_targets=encoder_targets,
+        ),
+        decoder=SimpleNamespace(
+            enabled=False,
+            lora_r=0,
+            lora_alpha=0.0,
+            lora_dropout=0.0,
+            lora_bias=False,
+            lora_targets={},
+        ),
+    )
 
 
 # ──────────────────────────────────────────────
@@ -448,10 +533,24 @@ def main_worker(args):
     )
     model.to(device)
 
-    # freeze image_encoder
-    for name, param in model.named_parameters():
-        if "image_encoder" in name:
-            param.requires_grad = False
+    if args.lora_vit:
+        lora_cfg = _build_vit_lora_cfg(args)
+        model = inject_lora_sam(model, lora_cfg)
+        if is_main_process():
+            active_targets = [name for name, enabled in lora_cfg.encoder.lora_targets.items() if enabled]
+            print(f"LoRA enabled for ViT encoder with targets: {', '.join(active_targets)}")
+    else:
+        # Preserve the original behavior when LoRA is disabled.
+        for name, param in model.named_parameters():
+            if "image_encoder" in name:
+                param.requires_grad = False
+        if is_main_process():
+            print("LoRA disabled; SAM image encoder remains frozen.")
+
+    if is_main_process():
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"Trainable params: {trainable_params:,} / {total_params:,}")
 
     # ── Wrap with DDP if distributed ──
     if args.distributed:

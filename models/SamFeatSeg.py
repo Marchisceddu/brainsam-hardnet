@@ -59,7 +59,7 @@ class SamFeatSeg(nn.Module):
         for Y in range(self.iter_2stage): #最小设为1
             p2_in = F.interpolate(
                 out1_d,
-                (256, 256),
+                self.prompt_encoder_end.mask_input_size,
                 mode="bilinear",
                 align_corners=False,
             )

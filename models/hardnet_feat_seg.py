@@ -51,7 +51,7 @@ class HardNetFeatSeg(nn.Module):
             p2_in = torch.sigmoid(out1_d)
             p2_in = F.interpolate(
                 p2_in,
-                (256, 256),
+                self.prompt_encoder_end.mask_input_size,
                 mode="bilinear",
                 align_corners=False,
             )

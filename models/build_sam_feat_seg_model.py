@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 from functools import partial
 
@@ -7,6 +8,41 @@ from .hardnet_segmentation_head import HardNetSegmentationHead
 from .hardnet_feat_seg import HardNetFeatSeg
 # from .sam_decoder import MaskDecoder
 from segment_anything.modeling import ImageEncoderViT, PromptEncoder,TwoWayTransformer
+
+
+def _resize_sam_pos_embed(pos_embed, target_shape):
+    """Resize SAM absolute positional embedding [1,H,W,C] to target [1,Ht,Wt,C]."""
+    _, target_h, target_w, _ = target_shape
+    pos_embed = pos_embed.permute(0, 3, 1, 2)
+    pos_embed = F.interpolate(
+        pos_embed,
+        size=(target_h, target_w),
+        mode="bilinear",
+        align_corners=False,
+    )
+    return pos_embed.permute(0, 2, 3, 1)
+
+
+def _resize_sam_rel_pos(rel_pos, target_shape):
+    """Resize SAM relative positional embedding [L,D] to target [Lt,Dt]."""
+    rel_pos = rel_pos.unsqueeze(0).unsqueeze(0)
+    rel_pos = F.interpolate(
+        rel_pos,
+        size=target_shape,
+        mode="bilinear",
+        align_corners=False,
+    )
+    return rel_pos[0, 0, ...]
+
+
+def _is_global_rel_pos_key(key, encoder_global_attn_indexes):
+    if "image_encoder.blocks." not in key or ".attn.rel_pos" not in key:
+        return False
+    try:
+        block_idx = int(key.split(".")[2])
+    except (IndexError, ValueError):
+        return False
+    return block_idx in encoder_global_attn_indexes
 
 
 def _adapt_sam_patch_embed_in_channels(image_encoder, input_channels):
@@ -30,7 +66,7 @@ def _adapt_sam_patch_embed_in_channels(image_encoder, input_channels):
     image_encoder.patch_embed.proj = new_proj
 
 
-def _load_checkpoint_safely(model, checkpoint_path):
+def _load_checkpoint_safely(model, checkpoint_path, encoder_global_attn_indexes):
     """Load only compatible checkpoint tensors; adapt SAM patch-embed 3->1 when needed."""
     with open(checkpoint_path, "rb") as f:
         state_dict = torch.load(f, weights_only=False)
@@ -41,6 +77,7 @@ def _load_checkpoint_safely(model, checkpoint_path):
     model_state = model.state_dict()
     filtered_state = {}
     loaded_keys = []
+    resized_keys = []
     skipped_shape = []
 
     for key, value in state_dict.items():
@@ -60,10 +97,31 @@ def _load_checkpoint_safely(model, checkpoint_path):
                 loaded_keys.append(key)
                 continue
 
+        # Special case: SAM absolute positional embedding interpolation.
+        if key == "image_encoder.pos_embed":
+            if value.ndim == 4 and target.ndim == 4 and value.shape[0] == target.shape[0] and value.shape[-1] == target.shape[-1]:
+                filtered_state[key] = _resize_sam_pos_embed(value, target.shape)
+                loaded_keys.append(key)
+                resized_keys.append((key, tuple(value.shape), tuple(target.shape)))
+                continue
+
+        # Special case: SAM global-attention relative positional embeddings.
+        if _is_global_rel_pos_key(key, encoder_global_attn_indexes):
+            if value.ndim == 2 and target.ndim == 2:
+                filtered_state[key] = _resize_sam_rel_pos(value, tuple(target.shape))
+                loaded_keys.append(key)
+                resized_keys.append((key, tuple(value.shape), tuple(target.shape)))
+                continue
+
         skipped_shape.append((key, tuple(value.shape), tuple(target.shape)))
 
     model.load_state_dict(filtered_state, strict=False)
-    print(f"load keys over! loaded={len(loaded_keys)} skipped_shape={len(skipped_shape)}")
+    print(
+        f"load keys over! loaded={len(loaded_keys)} "
+        f"resized={len(resized_keys)} skipped_shape={len(skipped_shape)}"
+    )
+    if resized_keys:
+        print("Resized keys example:", resized_keys[:5])
     if skipped_shape:
         print("Skipped (shape mismatch) keys example:", skipped_shape[:5])
 
@@ -97,13 +155,12 @@ def _build_feat_seg_model(
     checkpoint=None,
 ):
     prompt_embed_dim = 256
-    image_size = 1024
     vit_patch_size = 16
-    image_embedding_size = image_size // vit_patch_size
+    image_embedding_size = img_size // vit_patch_size
     image_encoder = ImageEncoderViT(
         depth=encoder_depth,
         embed_dim=encoder_embed_dim,
-        img_size=image_size,
+        img_size=img_size,
         mlp_ratio=4,
         norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
         num_heads=encoder_num_heads,
@@ -126,14 +183,18 @@ def _build_feat_seg_model(
         prompt_encoder_end=PromptEncoder(
             embed_dim=prompt_embed_dim,
             image_embedding_size=(image_embedding_size, image_embedding_size),
-            input_image_size=(image_size, image_size),
+            input_image_size=(img_size, img_size),
             mask_in_chans=16,
         ),
         seg_decoder_end=SegDecoderCNN(num_classes=num_classes, num_depth=4, p_channel=0, promptemd_channel=256, first_p=False),
     )
 
     if checkpoint is not None:
-        _load_checkpoint_safely(sam_seg, checkpoint)
+        _load_checkpoint_safely(
+            sam_seg,
+            checkpoint,
+            encoder_global_attn_indexes=encoder_global_attn_indexes,
+        )
     return sam_seg
 
 
@@ -149,13 +210,12 @@ def _build_feat_seg_model_hardnet(
     checkpoint=None,
 ):
     prompt_embed_dim = 256
-    image_size = 1024
     vit_patch_size = 16
-    image_embedding_size = image_size // vit_patch_size
+    image_embedding_size = img_size // vit_patch_size
     image_encoder = ImageEncoderViT(
         depth=encoder_depth,
         embed_dim=encoder_embed_dim,
-        img_size=image_size,
+        img_size=img_size,
         mlp_ratio=4,
         norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
         num_heads=encoder_num_heads,
@@ -190,7 +250,7 @@ def _build_feat_seg_model_hardnet(
         prompt_encoder_end=PromptEncoder(
             embed_dim=prompt_embed_dim,
             image_embedding_size=(image_embedding_size, image_embedding_size),
-            input_image_size=(image_size, image_size),
+            input_image_size=(img_size, img_size),
             mask_in_chans=16,
         ),
         seg_decoder_end=SegDecoderCNN(
@@ -203,7 +263,11 @@ def _build_feat_seg_model_hardnet(
     )
 
     if checkpoint is not None:
-        _load_checkpoint_safely(sam_seg, checkpoint)
+        _load_checkpoint_safely(
+            sam_seg,
+            checkpoint,
+            encoder_global_attn_indexes=encoder_global_attn_indexes,
+        )
     return sam_seg
 
 
