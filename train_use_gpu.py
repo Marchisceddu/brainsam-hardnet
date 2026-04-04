@@ -130,11 +130,8 @@ parser.add_argument('--use_tensorboard', action='store_true',
                 help='Enable TensorBoard logging (disabled by default to avoid TensorFlow startup warnings).')
 
 # LoRA only for the SAM ViT image encoder.
-parser.add_argument('--lora_vit', dest='lora_vit', action='store_true',
+parser.add_argument('--lora_vit', action='store_true',
                 help='Enable LoRA adapters in the SAM ViT image encoder.')
-parser.add_argument('--no_lora_vit', dest='lora_vit', action='store_false',
-                help='Disable LoRA adapters in the SAM ViT image encoder.')
-parser.set_defaults(lora_vit=True)
 parser.add_argument('--lora_vit_targets', type=str, default='q,v,mlp1,mlp2',
                 help='Comma-separated LoRA targets for the ViT encoder. '
                     'Supported values: q, k, v, out, mlp1, mlp2. '
@@ -470,9 +467,10 @@ def _rebuild_volumes_for_3d_validation(
             
         key = (patient, timepoint)
         if key not in volume_dict:
-            volume_dict[key] = {'pred': {}, 'gt': {}}
+            volume_dict[key] = {'pred1': {}, 'pred2': {}, 'gt': {}}
         
-        volume_dict[key]['pred'][slice_idx] = batch_item['pred_binary']
+        volume_dict[key]['pred1'][slice_idx] = batch_item['pred1_binary']
+        volume_dict[key]['pred2'][slice_idx] = batch_item['pred2_binary']
         volume_dict[key]['gt'][slice_idx] = batch_item['gt_binary']
     
     return volume_dict, len(volume_dict)
@@ -743,7 +741,7 @@ def main_worker(args):
                   f"→ effective batch size = {eff_bs}")
 
     best_loss = float('inf')
-    best_dsc_3d_macro = float('-inf')
+    best_dsc_3d_macro_stage2 = float('-inf')
     use_3d_dsc_selection = False  # Will be True after first validation with valid 3D DSC
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -768,10 +766,10 @@ def main_worker(args):
                             wandb_run=wandb_run)
 
         # Extract 3D DSC if available
-        val_dsc_3d_macro = val_metrics.get("val/dsc_3d_macro", float('nan'))
+        val_dsc_3d_macro_stage2 = val_metrics.get("val/dsc_3d_macro_stage2", float('nan'))
         
         # Determine if we have valid 3D DSC for checkpoint selection
-        has_valid_3d_dsc = not (np.isnan(val_dsc_3d_macro) or np.isinf(val_dsc_3d_macro))
+        has_valid_3d_dsc = not (np.isnan(val_dsc_3d_macro_stage2) or np.isinf(val_dsc_3d_macro_stage2))
         if has_valid_3d_dsc:
             use_3d_dsc_selection = True
 
@@ -786,8 +784,8 @@ def main_worker(args):
             total_payload.update(train_metrics)
             total_payload.update(val_metrics)
 
-            if use_3d_dsc_selection and has_valid_3d_dsc and val_dsc_3d_macro > best_dsc_3d_macro:
-                total_payload["val/best_dsc_3d_macro"] = val_dsc_3d_macro
+            if use_3d_dsc_selection and has_valid_3d_dsc and val_dsc_3d_macro_stage2 > best_dsc_3d_macro_stage2:
+                total_payload["val/best_dsc_3d_macro_stage2"] = val_dsc_3d_macro_stage2
             elif not use_3d_dsc_selection and val_loss < best_loss:
                 total_payload["val/best_loss"] = val_loss
 
@@ -814,8 +812,8 @@ def main_worker(args):
         is_best_epoch = False
         if is_main_process():
             if use_3d_dsc_selection and has_valid_3d_dsc:
-                if val_dsc_3d_macro > best_dsc_3d_macro:
-                    best_dsc_3d_macro = val_dsc_3d_macro
+                if val_dsc_3d_macro_stage2 > best_dsc_3d_macro_stage2:
+                    best_dsc_3d_macro_stage2 = val_dsc_3d_macro_stage2
                     is_best_epoch = True
             else:
                 if val_loss < best_loss:
@@ -823,7 +821,7 @@ def main_worker(args):
                     is_best_epoch = True
 
         if is_main_process() and is_best_epoch:
-            metric_str = f'val_dsc_3d_macro = {val_dsc_3d_macro:.4f}' if has_valid_3d_dsc else f'val_loss = {val_loss:.6f}'
+            metric_str = f'val_dsc_3d_macro_stage2 = {val_dsc_3d_macro_stage2:.4f}' if has_valid_3d_dsc else f'val_loss = {val_loss:.6f}'
             print(f'save model (best): {metric_str}')
             # save the underlying model state_dict (without DDP wrapper)
             model_state = model.module.state_dict() if args.distributed else model.state_dict()
@@ -962,10 +960,6 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
     use_ce = isinstance(criterion, nn.CrossEntropyLoss)
 
     val_loss_sum = 0.0
-    iou_stage1_sum = 0.0   # IoU for img_out1 (first decoder)
-    iou_stage2_sum = 0.0   # IoU for img_out  (refined decoder)
-    dsc_stage1_sum = 0.0   # DSC for img_out1
-    dsc_stage2_sum = 0.0   # DSC for img_out
     num_batches = 0
     vis_dict = None
     val_loader_data = []  # Collect batch data for 3D reconstruction
@@ -987,20 +981,16 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
                 loss = criterion(img_out_for_loss, mask_monai) * 0.3 + criterion(img_out1_for_loss, mask_monai) * 0.7
 
             val_loss_sum += loss.item()
-
-            # Separate metrics for each decoder stage
-            iou_stage1_sum += iou_score(mask, img_out1_for_loss)
-            iou_stage2_sum += iou_score(mask, img_out_for_loss)
-            dsc_stage1_sum += dsc_score(mask, img_out1_for_loss)
-            dsc_stage2_sum += dsc_score(mask, img_out_for_loss)
             num_batches += 1
 
             # Collect data for 3D validation (per-volume DSC)
             for i in range(img.shape[0]):
-                pred_binary = (img_out[i].argmax(dim=0) > 0).detach().cpu().numpy().astype(np.uint8)
+                pred1_binary = _logits_to_fg_mask(img_out1[i])
+                pred2_binary = _logits_to_fg_mask(img_out[i])
                 gt_binary = mask[i].detach().cpu().numpy().astype(np.uint8)
                 val_loader_data.append({
-                    'pred_binary': pred_binary,
+                    'pred1_binary': pred1_binary,
+                    'pred2_binary': pred2_binary,
                     'gt_binary': gt_binary,
                     'patient': batch['patient'][i] if 'patient' in batch else None,
                     'timepoint': batch['timepoint'][i] if 'timepoint' in batch else None,
@@ -1019,96 +1009,108 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
     # ── Synchronize validation metrics across all GPUs ──
     if args.distributed:
         val_loss_sum = reduce_tensor(val_loss_sum, device)
-        iou_stage1_sum = reduce_tensor(iou_stage1_sum, device)
-        iou_stage2_sum = reduce_tensor(iou_stage2_sum, device)
-        dsc_stage1_sum = reduce_tensor(dsc_stage1_sum, device)
-        dsc_stage2_sum = reduce_tensor(dsc_stage2_sum, device)
         num_batches = reduce_tensor(num_batches, device)
+
+        # Gather slice predictions from all GPUs for 3D metric calculation
+        gathered_data = [None for _ in range(dist.get_world_size())]
+        dist.all_gather_object(gathered_data, val_loader_data)
+        val_loader_data = [item for sublist in gathered_data if sublist is not None for item in sublist]
 
     # Average over total batches across all GPUs
     num_batches = max(num_batches, 1)
     val_loss = val_loss_sum / num_batches
-    iou_stage1 = iou_stage1_sum / num_batches
-    iou_stage2 = iou_stage2_sum / num_batches
-    dsc_stage1 = dsc_stage1_sum / num_batches
-    dsc_stage2 = dsc_stage2_sum / num_batches
 
     # ── Compute 3D volume-wise DSC (if metadata available) ──
-    val_dsc_3d_macro = float('nan')
-    val_dsc_3d_micro = float('nan')
+    val_dsc_3d_macro_stage1 = float('nan')
+    val_dsc_3d_micro_stage1 = float('nan')
+    val_dsc_3d_macro_stage2 = float('nan')
+    val_dsc_3d_micro_stage2 = float('nan')
     num_volumes_3d = 0
     
     if val_loader_data:
         volume_dict, num_volumes_3d = _rebuild_volumes_for_3d_validation(val_loader_data)
         
         if num_volumes_3d > 0 and is_main_process():
-            dice_metric = DiceMetric(include_background=False, reduction="mean")
-            dsc_3d_values = []
-            global_tp, global_fp, global_fn = 0, 0, 0
+            dice_metric_s1 = DiceMetric(include_background=False, reduction="mean")
+            dice_metric_s2 = DiceMetric(include_background=False, reduction="mean")
+            dsc_3d_values_s1 = []
+            dsc_3d_values_s2 = []
+            global_tp_s1, global_fp_s1, global_fn_s1 = 0, 0, 0
+            global_tp_s2, global_fp_s2, global_fn_s2 = 0, 0, 0
             
             # Natural sort by patient then timepoint
             sorted_keys = sorted(volume_dict.keys(), key=lambda k: (_natural_key(k[0]), _natural_key(k[1])))
             
             for patient, timepoint in sorted_keys:
-                pred_map = volume_dict[(patient, timepoint)]['pred']
+                pred1_map = volume_dict[(patient, timepoint)]['pred1']
+                pred2_map = volume_dict[(patient, timepoint)]['pred2']
                 gt_map = volume_dict[(patient, timepoint)]['gt']
                 
-                all_indices = sorted(pred_map.keys())
-                pred_stack = np.stack([pred_map[s] for s in all_indices], axis=-1).astype(np.float32)
+                all_indices = sorted(pred1_map.keys())
+                pred1_stack = np.stack([pred1_map[s] for s in all_indices], axis=-1).astype(np.float32)
+                pred2_stack = np.stack([pred2_map[s] for s in all_indices], axis=-1).astype(np.float32)
                 gt_stack = np.stack([gt_map[s] for s in all_indices], axis=-1).astype(np.float32)
                 
                 # Convert to MONAI format: [B, C, H, W, D] with C=1
-                pred_oh = np.stack([1 - pred_stack, pred_stack], axis=0)
+                pred1_oh = np.stack([1 - pred1_stack, pred1_stack], axis=0)
+                pred2_oh = np.stack([1 - pred2_stack, pred2_stack], axis=0)
                 gt_oh = np.stack([1 - gt_stack, gt_stack], axis=0)
-                pred_t = torch.from_numpy(pred_oh).unsqueeze(0)
+                
+                pred1_t = torch.from_numpy(pred1_oh).unsqueeze(0)
+                pred2_t = torch.from_numpy(pred2_oh).unsqueeze(0)
                 gt_t = torch.from_numpy(gt_oh).unsqueeze(0)
                 
-                dice_metric.reset()
-                dice_val = float(dice_metric(y_pred=pred_t, y=gt_t).squeeze().item())
-                dsc_3d_values.append(dice_val)
+                dice_metric_s1.reset()
+                dice_val_s1 = float(dice_metric_s1(y_pred=pred1_t, y=gt_t).squeeze().item())
+                dsc_3d_values_s1.append(dice_val_s1)
+
+                dice_metric_s2.reset()
+                dice_val_s2 = float(dice_metric_s2(y_pred=pred2_t, y=gt_t).squeeze().item())
+                dsc_3d_values_s2.append(dice_val_s2)
                 
                 # Accumulate for micro DSC
-                pred_fg = (pred_stack > 0.5).astype(bool)
+                pred1_fg = (pred1_stack > 0.5).astype(bool)
+                pred2_fg = (pred2_stack > 0.5).astype(bool)
                 gt_fg = gt_stack.astype(bool)
-                global_tp += int(np.logical_and(pred_fg, gt_fg).sum())
-                global_fp += int(np.logical_and(pred_fg, np.logical_not(gt_fg)).sum())
-                global_fn += int(np.logical_and(np.logical_not(pred_fg), gt_fg).sum())
+                
+                global_tp_s1 += int(np.logical_and(pred1_fg, gt_fg).sum())
+                global_fp_s1 += int(np.logical_and(pred1_fg, np.logical_not(gt_fg)).sum())
+                global_fn_s1 += int(np.logical_and(np.logical_not(pred1_fg), gt_fg).sum())
+                
+                global_tp_s2 += int(np.logical_and(pred2_fg, gt_fg).sum())
+                global_fp_s2 += int(np.logical_and(pred2_fg, np.logical_not(gt_fg)).sum())
+                global_fn_s2 += int(np.logical_and(np.logical_not(pred2_fg), gt_fg).sum())
             
-            val_dsc_3d_macro = float(np.nanmean(dsc_3d_values)) if dsc_3d_values else float('nan')
+            val_dsc_3d_macro_stage1 = float(np.nanmean(dsc_3d_values_s1)) if dsc_3d_values_s1 else float('nan')
+            val_dsc_3d_macro_stage2 = float(np.nanmean(dsc_3d_values_s2)) if dsc_3d_values_s2 else float('nan')
             
             # Micro DSC from global TP/FP/FN
-            if (global_tp + global_fp + global_fn) > 0:
-                val_dsc_3d_micro = (2.0 * global_tp) / (2.0 * global_tp + global_fp + global_fn)
-            else:
-                val_dsc_3d_micro = float('nan')
+            if (global_tp_s1 + global_fp_s1 + global_fn_s1) > 0:
+                val_dsc_3d_micro_stage1 = (2.0 * global_tp_s1) / (2.0 * global_tp_s1 + global_fp_s1 + global_fn_s1)
+            if (global_tp_s2 + global_fp_s2 + global_fn_s2) > 0:
+                val_dsc_3d_micro_stage2 = (2.0 * global_tp_s2) / (2.0 * global_tp_s2 + global_fp_s2 + global_fn_s2)
     
     if is_main_process():
         print(f'epoch[{epoch}]: val_loss     = {val_loss:.6f}')
-        print(f'epoch[{epoch}]: val_iou_stage1 (img_out1) = {iou_stage1:.4f}')
-        print(f'epoch[{epoch}]: val_iou_stage2 (img_out)  = {iou_stage2:.4f}')
-        print(f'epoch[{epoch}]: val_dsc_stage1 (img_out1) = {dsc_stage1:.4f}')
-        print(f'epoch[{epoch}]: val_dsc_stage2 (img_out)  = {dsc_stage2:.4f}')
         if num_volumes_3d > 0:
-            print(f'epoch[{epoch}]: val_dsc_3d_macro (per-volume) = {val_dsc_3d_macro:.4f} ({num_volumes_3d} volumes)')
-            print(f'epoch[{epoch}]: val_dsc_3d_micro (global) = {val_dsc_3d_micro:.4f}')
+            print(f'epoch[{epoch}]: val_dsc_3d_macro_stage1 (per-volume) = {val_dsc_3d_macro_stage1:.4f} ({num_volumes_3d} volumes)')
+            print(f'epoch[{epoch}]: val_dsc_3d_micro_stage1 (global) = {val_dsc_3d_micro_stage1:.4f}')
+            print(f'epoch[{epoch}]: val_dsc_3d_macro_stage2 (per-volume) = {val_dsc_3d_macro_stage2:.4f} ({num_volumes_3d} volumes)')
+            print(f'epoch[{epoch}]: val_dsc_3d_micro_stage2 (global) = {val_dsc_3d_micro_stage2:.4f}')
 
         if writer is not None:
             writer.add_scalar("val_loss", val_loss, global_step=epoch)
-            writer.add_scalar("val_iou_stage1", iou_stage1, global_step=epoch)
-            writer.add_scalar("val_iou_stage2", iou_stage2, global_step=epoch)
-            writer.add_scalar("val_dsc_stage1", dsc_stage1, global_step=epoch)
-            writer.add_scalar("val_dsc_stage2", dsc_stage2, global_step=epoch)
             if num_volumes_3d > 0:
-                writer.add_scalar("val_dsc_3d_macro", val_dsc_3d_macro, global_step=epoch)
-                writer.add_scalar("val_dsc_3d_micro", val_dsc_3d_micro, global_step=epoch)
+                writer.add_scalar("val_dsc_3d_macro_stage1", val_dsc_3d_macro_stage1, global_step=epoch)
+                writer.add_scalar("val_dsc_3d_micro_stage1", val_dsc_3d_micro_stage1, global_step=epoch)
+                writer.add_scalar("val_dsc_3d_macro_stage2", val_dsc_3d_macro_stage2, global_step=epoch)
+                writer.add_scalar("val_dsc_3d_micro_stage2", val_dsc_3d_micro_stage2, global_step=epoch)
 
     return val_loss, {
-        "val/iou_stage1": iou_stage1,
-        "val/iou_stage2": iou_stage2,
-        "val/dsc_stage1": dsc_stage1,
-        "val/dsc_stage2": dsc_stage2,
-        "val/dsc_3d_macro": val_dsc_3d_macro,
-        "val/dsc_3d_micro": val_dsc_3d_micro,
+        "val/dsc_3d_macro_stage1": val_dsc_3d_macro_stage1,
+        "val/dsc_3d_micro_stage1": val_dsc_3d_micro_stage1,
+        "val/dsc_3d_macro_stage2": val_dsc_3d_macro_stage2,
+        "val/dsc_3d_micro_stage2": val_dsc_3d_micro_stage2,
     }, vis_dict
 
 

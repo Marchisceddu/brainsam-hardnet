@@ -46,9 +46,14 @@ class HardNetFeatSeg(nn.Module):
 
         for _ in range(self.iter_2stage):
             # Convert logits → probabilities before passing as mask prompt.
-            # SAM's prompt encoder mask_downscaling expects bounded [0,1] masks,
-            # not unbounded raw logits from HardNet.
-            p2_in = torch.sigmoid(out1_d)
+            # SAM's prompt encoder mask_downscaling expects bounded [0,1] masks
+            # with exactly 1 channel (the foreground probability).
+            if out1_d.shape[1] > 1:
+                # If multi-class, we take the foreground channel (index 1)
+                p2_in = torch.sigmoid(out1_d[:, 1:2, ...])
+            else:
+                p2_in = torch.sigmoid(out1_d)
+
             p2_in = F.interpolate(
                 p2_in,
                 self.prompt_encoder_end.mask_input_size,
