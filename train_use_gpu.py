@@ -4,6 +4,8 @@ import sys
 import shutil
 import warnings
 import contextlib
+import re
+from typing import Tuple, Dict
 import cv2
 import albumentations as albu
 from tqdm import tqdm
@@ -20,8 +22,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils import data
 from monai.losses import DiceLoss, DiceCELoss
+from monai.metrics import DiceMetric
 from models import sam_feat_seg_model_registry
-from train_dataset import Dataset
+from train_dataset import Dataset, parse_volume_info
 
 try:
     import wandb
@@ -352,6 +355,44 @@ def _build_wandb_qualitative_panel(img, gt, pred1, pred2):
     return panel
 
 
+def _natural_key(text: str):
+    """Return key for natural sorting (handles numbers correctly)."""
+    return [int(tok) if tok.isdigit() else tok.lower() for tok in re.split(r'(\d+)', text)]
+
+
+def _rebuild_volumes_for_3d_validation(
+    val_loader_data: list,
+) -> Tuple[Dict[Tuple[str, str], Dict], int]:
+    """
+    Rebuild 3D volumes from 2D slice predictions/GT for per-volume DSC calculation.
+    
+    Args:
+        val_loader_data: List of dicts with 'img', 'mask', 'patient', 'timepoint', 'slice_idx'
+        
+    Returns:
+        Tuple of (volume_dict, num_volumes_with_metadata)
+    """
+    volume_dict: Dict[Tuple[str, str], Dict[str, np.ndarray]] = {}
+    
+    for batch_item in val_loader_data:
+        patient = batch_item.get('patient')
+        timepoint = batch_item.get('timepoint')
+        slice_idx = batch_item.get('slice_idx')
+        
+        # Skip slices without volume metadata (legacy datasets)
+        if patient is None or timepoint is None or slice_idx is None:
+            continue
+            
+        key = (patient, timepoint)
+        if key not in volume_dict:
+            volume_dict[key] = {'pred': {}, 'gt': {}}
+        
+        volume_dict[key]['pred'][slice_idx] = batch_item['pred_binary']
+        volume_dict[key]['gt'][slice_idx] = batch_item['gt_binary']
+    
+    return volume_dict, len(volume_dict)
+
+
 def _log_wandb_validation_images(wandb_run, epoch, vis_dict, max_images):
     if wandb_run is None or vis_dict is None:
         return
@@ -603,6 +644,8 @@ def main_worker(args):
                   f"→ effective batch size = {eff_bs}")
 
     best_loss = float('inf')
+    best_dsc_3d_macro = float('-inf')
+    use_3d_dsc_selection = False  # Will be True after first validation with valid 3D DSC
 
     for epoch in range(args.start_epoch, args.epochs):
         # set epoch for distributed sampler (ensures proper shuffling)
@@ -625,6 +668,14 @@ def main_worker(args):
         val_loss, val_metrics, vis_dict = validate(val_loader, model, epoch, args, writer, device, criterion,
                             wandb_run=wandb_run)
 
+        # Extract 3D DSC if available
+        val_dsc_3d_macro = val_metrics.get("val/dsc_3d_macro", float('nan'))
+        
+        # Determine if we have valid 3D DSC for checkpoint selection
+        has_valid_3d_dsc = not (np.isnan(val_dsc_3d_macro) or np.isinf(val_dsc_3d_macro))
+        if has_valid_3d_dsc:
+            use_3d_dsc_selection = True
+
         # ── Consolidated W&B logging (once per epoch cycle) ──
         if is_main_process() and wandb_run is not None:
             total_payload = {
@@ -636,7 +687,9 @@ def main_worker(args):
             total_payload.update(train_metrics)
             total_payload.update(val_metrics)
 
-            if val_loss < best_loss: # Use current cycle's best
+            if use_3d_dsc_selection and has_valid_3d_dsc and val_dsc_3d_macro > best_dsc_3d_macro:
+                total_payload["val/best_dsc_3d_macro"] = val_dsc_3d_macro
+            elif not use_3d_dsc_selection and val_loss < best_loss:
                 total_payload["val/best_loss"] = val_loss
 
             wandb_run.log(total_payload)
@@ -658,20 +711,38 @@ def main_worker(args):
 
         scheduler.step()
 
-        # save checkpoint (only rank 0)
-        if is_main_process() and val_loss < best_loss:
-            best_loss = val_loss
-            filename = f'all_model_{epoch}.pth'
-            print(f'save model: val_loss = {val_loss}')
+        # save checkpoint (only rank 0): prioritize 3D DSC when available, else use loss
+        is_best_epoch = False
+        if is_main_process():
+            if use_3d_dsc_selection and has_valid_3d_dsc:
+                if val_dsc_3d_macro > best_dsc_3d_macro:
+                    best_dsc_3d_macro = val_dsc_3d_macro
+                    is_best_epoch = True
+            else:
+                if val_loss < best_loss:
+                    best_loss = val_loss
+                    is_best_epoch = True
+
+        if is_main_process() and is_best_epoch:
+            metric_str = f'val_dsc_3d_macro = {val_dsc_3d_macro:.4f}' if has_valid_3d_dsc else f'val_loss = {val_loss:.6f}'
+            print(f'save model (best): {metric_str}')
             # save the underlying model state_dict (without DDP wrapper)
             model_state = model.module.state_dict() if args.distributed else model.state_dict()
             save_checkpoint({
                 'epoch': epoch + 1,
                 'state_dict': model_state,
                 'optimizer': optimizer.state_dict(),
-            }, is_best=True, filename=filename)
+            }, filename='all_model_best.pth')
 
-            # (Best loss already included in payload above if found)
+    # Save final model checkpoint (last epoch)
+    if is_main_process():
+        model_state = model.module.state_dict() if args.distributed else model.state_dict()
+        save_checkpoint({
+            'epoch': args.epochs,
+            'state_dict': model_state,
+            'optimizer': optimizer.state_dict(),
+        }, filename='all_model_final.pth')
+        print(f'save model (final): epoch {args.epochs}')
 
     if args.distributed:
         cleanup_distributed()
@@ -699,11 +770,11 @@ def train(train_loader, model, optimizer, epoch, args, writer, device, criterion
 
     optimizer.zero_grad()  # zero once at the start
 
-    for step, (img, label) in enumerate(tqdm(train_loader,
-                                              total=len(train_loader),
-                                              disable=not is_main_process())):
-        img = img.to(device)
-        mask = label.to(device, dtype=torch.long).squeeze(dim=1)
+    for step, batch in enumerate(tqdm(train_loader,
+                                      total=len(train_loader),
+                                      disable=not is_main_process())):
+        img = batch['img'].to(device)
+        mask = batch['mask'].to(device, dtype=torch.long).squeeze(dim=1)
 
         # ── Optionally skip DDP gradient sync on non-update steps ──
         # When using DDP, gradient all-reduce is expensive.  We can
@@ -798,12 +869,13 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
     dsc_stage2_sum = 0.0   # DSC for img_out
     num_batches = 0
     vis_dict = None
+    val_loader_data = []  # Collect batch data for 3D reconstruction
 
     with torch.no_grad():  # ← no gradient computation during validation
-        for img, label in tqdm(val_loader, total=len(val_loader),
-                               disable=not is_main_process()):
-            img = img.to(device)
-            mask = label.to(device, dtype=torch.long).squeeze(dim=1)
+        for batch in tqdm(val_loader, total=len(val_loader),
+                          disable=not is_main_process()):
+            img = batch['img'].to(device)
+            mask = batch['mask'].to(device, dtype=torch.long).squeeze(dim=1)
 
             img_out1, img_out, prompt_embedding = model(img)
             img_out1_for_loss = _ensure_multiclass_logits(img_out1, args.num_classes)
@@ -823,6 +895,18 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
             dsc_stage1_sum += dsc_score(mask, img_out1_for_loss)
             dsc_stage2_sum += dsc_score(mask, img_out_for_loss)
             num_batches += 1
+
+            # Collect data for 3D validation (per-volume DSC)
+            for i in range(img.shape[0]):
+                pred_binary = (img_out[i].argmax(dim=0) > 0).detach().cpu().numpy().astype(np.uint8)
+                gt_binary = mask[i].detach().cpu().numpy().astype(np.uint8)
+                val_loader_data.append({
+                    'pred_binary': pred_binary,
+                    'gt_binary': gt_binary,
+                    'patient': batch['patient'][i] if 'patient' in batch else None,
+                    'timepoint': batch['timepoint'][i] if 'timepoint' in batch else None,
+                    'slice_idx': int(batch['slice_idx'][i]) if 'slice_idx' in batch else None,
+                })
 
             if vis_dict is None and is_main_process() and args.wandb_log_images_every > 0:
                 max_n = max(1, args.wandb_max_images)
@@ -850,12 +934,64 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
     dsc_stage1 = dsc_stage1_sum / num_batches
     dsc_stage2 = dsc_stage2_sum / num_batches
 
+    # ── Compute 3D volume-wise DSC (if metadata available) ──
+    val_dsc_3d_macro = float('nan')
+    val_dsc_3d_micro = float('nan')
+    num_volumes_3d = 0
+    
+    if val_loader_data:
+        volume_dict, num_volumes_3d = _rebuild_volumes_for_3d_validation(val_loader_data)
+        
+        if num_volumes_3d > 0 and is_main_process():
+            dice_metric = DiceMetric(include_background=False, reduction="mean")
+            dsc_3d_values = []
+            global_tp, global_fp, global_fn = 0, 0, 0
+            
+            # Natural sort by patient then timepoint
+            sorted_keys = sorted(volume_dict.keys(), key=lambda k: (_natural_key(k[0]), _natural_key(k[1])))
+            
+            for patient, timepoint in sorted_keys:
+                pred_map = volume_dict[(patient, timepoint)]['pred']
+                gt_map = volume_dict[(patient, timepoint)]['gt']
+                
+                all_indices = sorted(pred_map.keys())
+                pred_stack = np.stack([pred_map[s] for s in all_indices], axis=-1).astype(np.float32)
+                gt_stack = np.stack([gt_map[s] for s in all_indices], axis=-1).astype(np.float32)
+                
+                # Convert to MONAI format: [B, C, H, W, D] with C=1
+                pred_oh = np.stack([1 - pred_stack, pred_stack], axis=0)
+                gt_oh = np.stack([1 - gt_stack, gt_stack], axis=0)
+                pred_t = torch.from_numpy(pred_oh).unsqueeze(0)
+                gt_t = torch.from_numpy(gt_oh).unsqueeze(0)
+                
+                dice_metric.reset()
+                dice_val = float(dice_metric(y_pred=pred_t, y=gt_t).squeeze().item())
+                dsc_3d_values.append(dice_val)
+                
+                # Accumulate for micro DSC
+                pred_fg = (pred_stack > 0.5).astype(bool)
+                gt_fg = gt_stack.astype(bool)
+                global_tp += int(np.logical_and(pred_fg, gt_fg).sum())
+                global_fp += int(np.logical_and(pred_fg, np.logical_not(gt_fg)).sum())
+                global_fn += int(np.logical_and(np.logical_not(pred_fg), gt_fg).sum())
+            
+            val_dsc_3d_macro = float(np.nanmean(dsc_3d_values)) if dsc_3d_values else float('nan')
+            
+            # Micro DSC from global TP/FP/FN
+            if (global_tp + global_fp + global_fn) > 0:
+                val_dsc_3d_micro = (2.0 * global_tp) / (2.0 * global_tp + global_fp + global_fn)
+            else:
+                val_dsc_3d_micro = float('nan')
+    
     if is_main_process():
         print(f'epoch[{epoch}]: val_loss     = {val_loss:.6f}')
         print(f'epoch[{epoch}]: val_iou_stage1 (img_out1) = {iou_stage1:.4f}')
         print(f'epoch[{epoch}]: val_iou_stage2 (img_out)  = {iou_stage2:.4f}')
         print(f'epoch[{epoch}]: val_dsc_stage1 (img_out1) = {dsc_stage1:.4f}')
         print(f'epoch[{epoch}]: val_dsc_stage2 (img_out)  = {dsc_stage2:.4f}')
+        if num_volumes_3d > 0:
+            print(f'epoch[{epoch}]: val_dsc_3d_macro (per-volume) = {val_dsc_3d_macro:.4f} ({num_volumes_3d} volumes)')
+            print(f'epoch[{epoch}]: val_dsc_3d_micro (global) = {val_dsc_3d_micro:.4f}')
 
         if writer is not None:
             writer.add_scalar("val_loss", val_loss, global_step=epoch)
@@ -863,12 +999,17 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
             writer.add_scalar("val_iou_stage2", iou_stage2, global_step=epoch)
             writer.add_scalar("val_dsc_stage1", dsc_stage1, global_step=epoch)
             writer.add_scalar("val_dsc_stage2", dsc_stage2, global_step=epoch)
+            if num_volumes_3d > 0:
+                writer.add_scalar("val_dsc_3d_macro", val_dsc_3d_macro, global_step=epoch)
+                writer.add_scalar("val_dsc_3d_micro", val_dsc_3d_micro, global_step=epoch)
 
     return val_loss, {
         "val/iou_stage1": iou_stage1,
         "val/iou_stage2": iou_stage2,
         "val/dsc_stage1": dsc_stage1,
         "val/dsc_stage2": dsc_stage2,
+        "val/dsc_3d_macro": val_dsc_3d_macro,
+        "val/dsc_3d_micro": val_dsc_3d_micro,
     }, vis_dict
 
 
@@ -876,10 +1017,8 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
 #  Utilities
 # ──────────────────────────────────────────────
 
-def save_checkpoint(state, is_best, filename='checkpoint.pth'):
+def save_checkpoint(state, filename='checkpoint.pth'):
     torch.save(state, filename)
-    if is_best:
-        shutil.copyfile(filename, 'all_model_best.pth')
 
 
 class AverageMeter(object):

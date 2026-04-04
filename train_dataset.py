@@ -1,8 +1,25 @@
 import os
+import re
+from typing import Tuple
 import numpy as np
 import torch
 import torch.utils.data
 from PIL import Image
+
+
+VOLUME_FILENAME_RE = re.compile(r"^(P\d+)_(T\d+)_(\d+)\.[^.]+$")
+
+
+def parse_volume_info(filename: str) -> Tuple[str, str, int]:
+    """Extract (patient, timepoint, slice_idx) from filename pattern P<id>_T<id>_<slice>.<ext>."""
+    base = os.path.basename(filename)
+    m = VOLUME_FILENAME_RE.match(base)
+    if m is None:
+        # Fallback: return None to indicate unparseable (for legacy datasets)
+        return None, None, None
+    patient, timepoint, slice_idx = m.group(1), m.group(2), int(m.group(3))
+    return patient, timepoint, slice_idx
+
 
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, args, names, transform=None, img_dir=None, mask_dir=None):
@@ -92,5 +109,14 @@ class Dataset(torch.utils.data.Dataset):
         mask = np.transpose(mask,(2,0,1))
         mask = (mask > 127).astype('float32')  # Binarize: {0,255} → {0,1}
 
-        # return img, mask, {'img_id': img_id}
-        return img, mask
+        # Parse volume metadata if available (for 3D validation)
+        patient, timepoint, slice_idx = parse_volume_info(img_id + self.format_img)
+
+        return {
+            'img': img,
+            'mask': mask,
+            'img_id': img_id,
+            'patient': patient,
+            'timepoint': timepoint,
+            'slice_idx': slice_idx,
+        }
