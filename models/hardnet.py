@@ -253,6 +253,24 @@ class HarDNet(nn.Module):
                 self.full_features = [96, 192, 320, 720, 1280]
                 self.list = [1, 4, 9, 14, 18]
 
+        # Keep architecture metadata available even when pretrained=False.
+        if not hasattr(self, 'features'):
+            if arch == 39:
+                self.features = 640
+                self.base = self.base[0:11]
+                self.full_features = [48, 96, 320, 640, 1024]
+                self.list = [1, 4, 7, 10, 13]
+            elif arch == 68:
+                self.features = 1024
+                self.base = self.base[0:16]
+                self.full_features = [64, 128, 320, 640, 1024]
+                self.list = [1, 4, 9, 12, 15]
+            elif arch == 85:
+                self.features = 1280
+                self.base = self.base[0:19]
+                self.full_features = [96, 192, 320, 720, 1280]
+                self.list = [1, 4, 9, 14, 18]
+
     def forward(self, x):
         for inx, layer in enumerate(self.base):
             x = layer(x)

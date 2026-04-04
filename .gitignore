@@ -211,3 +211,6 @@ __marimo__/
 
 #Dataset
 dataset/
+
+#Experiments
+exp/

@@ -68,6 +68,23 @@ def _load_checkpoint_safely(model, checkpoint_path):
         print("Skipped (shape mismatch) keys example:", skipped_shape[:5])
 
 
+def _checkpoint_has_hardnet_weights(checkpoint_path):
+    """Return True if the checkpoint contains HardNet-first-stage weights."""
+    with open(checkpoint_path, "rb") as f:
+        state_dict = torch.load(f, weights_only=False)
+
+    if isinstance(state_dict, dict) and "state_dict" in state_dict and isinstance(state_dict["state_dict"], dict):
+        state_dict = state_dict["state_dict"]
+
+    if not isinstance(state_dict, dict):
+        return False
+
+    for key in state_dict.keys():
+        if key.startswith("hardnet_first_stage.backbone."):
+            return True
+    return False
+
+
 def _build_feat_seg_model(
     img_size,
     iter_2stage,
@@ -151,13 +168,19 @@ def _build_feat_seg_model_hardnet(
     )
     _adapt_sam_patch_embed_in_channels(image_encoder, input_channels)
 
+    hardnet_pretrained = True
+    if checkpoint is not None:
+        # If checkpoint already contains hardnet weights, avoid extra ImageNet download
+        # and avoid initializing then immediately overriding those same tensors.
+        hardnet_pretrained = not _checkpoint_has_hardnet_weights(checkpoint)
+
     sam_seg = HardNetFeatSeg(
         iter_2stage=iter_2stage,
         img_size=img_size,
         image_encoder=image_encoder,
         hardnet_first_stage=HardNetSegmentationHead(
             arch=85,
-            pretrained=True,
+            pretrained=hardnet_pretrained,
             in_channels=input_channels,
             backbone_input_size=512,
             prompt_size=256,

@@ -58,6 +58,29 @@ python inference.py \
   --model_path checkpoints/all_model_best.pth \
   --img_out_path results/
 ```
+
+### 3D MONAI Evaluation (Volume-wise from 2D slices)
+To evaluate predictions volume-by-volume using MONAI metrics (Dice with `include_background=False`, PPV, TPR, HD95), run:
+
+```bash
+python evaluate_3d_monai.py \
+  --test_img_path dataset/subsettif_minmax/val/images \
+  --test_label_path dataset/subsettif_minmax/val/labels \
+  --model_path checkpoints/all_model_best.pth \
+  --model_type vit_l_hardnet \
+  --input_channels 1 \
+  --img_size 1024 \
+  --img_glob "*.tif" \
+  --eval_stage final \
+  --output_csv metrics_per_volume.csv \
+  --output_json metrics_summary.json
+```
+
+Expected filename format for grouping slices into 3D volumes:
+- `P<patient>_T<timepoint>_<sliceIdx>.<ext>`
+- Example: `P54_T1_028.tif`
+
+The script runs 2D inference slice-wise, groups slices by `(patient, timepoint)`, stacks available slices in ascending index order, and computes 3D metrics per volume.
 ## Datasets
 The following datasets are used in this study:
 - A𝛽 Dataset: A𝛽 Plaque, contains images with diffuse boundary structures.
