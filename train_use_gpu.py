@@ -331,7 +331,7 @@ def setup_distributed():
     """
     # Ensure NCCL works on Kaggle / multi-GPU setups
     os.environ.setdefault('NCCL_DEBUG', 'WARN')
-    os.environ.setdefault('NCCL_BLOCKING_WAIT', '1')
+    os.environ.setdefault('TORCH_NCCL_BLOCKING_WAIT', '1')
 
     dist.init_process_group(backend='nccl')
     local_rank = int(os.environ['LOCAL_RANK'])

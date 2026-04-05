@@ -121,10 +121,37 @@ class MaskDecoder(nn.Module):
         output_tokens = torch.cat([self.iou_token.weight, self.mask_tokens.weight], dim=0)
         output_tokens = output_tokens.unsqueeze(0).expand(sparse_prompt_embeddings.size(0), -1, -1)
         tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)
-        # Expand per-image data in batch direction to be per-mask
-        src = torch.repeat_interleave(image_embeddings, tokens.shape[0], dim=0)
+        # Expand per-image data in batch direction to be per-mask.
+        # For standard SAM prompting, image_embeddings has B=1 and prompts can have B>1.
+        # In batched training, image_embeddings and prompts usually have the same B.
+        if image_embeddings.shape[0] == tokens.shape[0]:
+            src = image_embeddings
+        elif image_embeddings.shape[0] == 1:
+            src = torch.repeat_interleave(image_embeddings, tokens.shape[0], dim=0)
+        else:
+            raise RuntimeError(
+                f"Incompatible batch sizes: image_embeddings={image_embeddings.shape[0]}, "
+                f"prompt_batch={tokens.shape[0]}"
+            )
+
+        if dense_prompt_embeddings.shape[0] == 1 and src.shape[0] > 1:
+            dense_prompt_embeddings = torch.repeat_interleave(dense_prompt_embeddings, src.shape[0], dim=0)
+        elif dense_prompt_embeddings.shape[0] != src.shape[0]:
+            raise RuntimeError(
+                f"Incompatible dense prompt batch: dense_prompt_embeddings={dense_prompt_embeddings.shape[0]}, "
+                f"src_batch={src.shape[0]}"
+            )
+
         src = src + dense_prompt_embeddings
-        pos_src = torch.repeat_interleave(image_pe, tokens.shape[0], dim=0)
+
+        if image_pe.shape[0] == src.shape[0]:
+            pos_src = image_pe
+        elif image_pe.shape[0] == 1:
+            pos_src = torch.repeat_interleave(image_pe, src.shape[0], dim=0)
+        else:
+            raise RuntimeError(
+                f"Incompatible image_pe batch: image_pe={image_pe.shape[0]}, src_batch={src.shape[0]}"
+            )
         b, c, h, w = src.shape
 
         # Run the transformer
