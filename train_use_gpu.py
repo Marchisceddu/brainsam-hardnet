@@ -129,6 +129,14 @@ parser.add_argument('--wandb_max_images', type=int, default=2,
 parser.add_argument('--use_tensorboard', action='store_true',
                 help='Enable TensorBoard logging (disabled by default to avoid TensorFlow startup warnings).')
 
+# Scheduler parameters
+parser.add_argument('--lr_scheduler', type=str, default='plateau', choices=['step', 'plateau', 'both'],
+                help='Which learning rate scheduler to use (step, plateau, or both).')
+parser.add_argument('--plateau_patience', type=int, default=3,
+                help='Patience for ReduceLROnPlateau scheduler.')
+parser.add_argument('--plateau_factor', type=float, default=0.5,
+                help='Factor for ReduceLROnPlateau scheduler.')
+
 # LoRA only for the SAM ViT image encoder.
 parser.add_argument('--lora_vit', action='store_true',
                 help='Enable LoRA adapters in the SAM ViT image encoder.')
@@ -557,7 +565,18 @@ def main_worker(args):
     optimizer = torch.optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr
     )
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=8, gamma=0.5)
+    
+    if args.lr_scheduler in ['step', 'both']:
+        scheduler_step = torch.optim.lr_scheduler.StepLR(optimizer, step_size=8, gamma=0.5)
+    else:
+        scheduler_step = None
+        
+    if args.lr_scheduler in ['plateau', 'both']:
+        scheduler_plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', patience=args.plateau_patience, factor=args.plateau_factor
+        )
+    else:
+        scheduler_plateau = None
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -806,7 +825,10 @@ def main_worker(args):
                     max_images=max(1, args.wandb_max_images),
                 )
 
-        scheduler.step()
+        if scheduler_step is not None:
+            scheduler_step.step()
+        if scheduler_plateau is not None:
+            scheduler_plateau.step(val_loss)
 
         # save checkpoint (only rank 0): prioritize 3D DSC when available, else use loss
         is_best_epoch = False
