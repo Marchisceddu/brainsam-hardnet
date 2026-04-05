@@ -67,9 +67,9 @@ python evaluate_3d_monai.py \
   --test_img_path dataset/subsettif_minmax/val/images \
   --test_label_path dataset/subsettif_minmax/val/labels \
   --model_path checkpoints/all_model_best.pth \
-  --model_type vit_l_hardnet \
+  --model_type vit_l_hardnet_unet \
   --input_channels 1 \
-  --img_size 1024 \
+  --img_size 512 \
   --img_glob "*.tif" \
   --eval_stage final \
   --output_csv metrics_per_volume.csv \
