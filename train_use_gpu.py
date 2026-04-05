@@ -573,7 +573,7 @@ def main_worker(args):
         
     if args.lr_scheduler in ['plateau', 'both']:
         scheduler_plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', patience=args.plateau_patience, factor=args.plateau_factor
+            optimizer, mode='max', patience=args.plateau_patience, factor=args.plateau_factor
         )
     else:
         scheduler_plateau = None
@@ -828,7 +828,12 @@ def main_worker(args):
         if scheduler_step is not None:
             scheduler_step.step()
         if scheduler_plateau is not None:
-            scheduler_plateau.step(val_loss)
+            if has_valid_3d_dsc:
+                scheduler_plateau.step(val_dsc_3d_macro_stage2)
+            else:
+                # If no valid 3D DSC, we don't step the plateau scheduler
+                # for now, as it is configured in 'max' mode for DSC.
+                pass
 
         # save checkpoint (only rank 0): prioritize 3D DSC when available, else use loss
         is_best_epoch = False
