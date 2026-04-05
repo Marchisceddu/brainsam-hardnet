@@ -75,3 +75,65 @@ class HardNetFeatSeg(nn.Module):
 
         out2 = out1_d
         return out1, out2, prompt_embedding
+
+
+class SegDecoderCNN(nn.Module):
+    def __init__(self,
+                 num_classes=2,
+                 x_embed_dim=256,
+                 num_depth=4,
+                 top_channel=64,
+                 p_channel=3,
+                 promptemd_channel=256,
+                 first_p=True,
+                 ):
+        super().__init__()
+        self.first_p = first_p
+        self.input_block = nn.Sequential(
+            nn.Conv2d(x_embed_dim+promptemd_channel, top_channel*2**num_depth, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(top_channel * 2 ** num_depth, top_channel * 2 ** num_depth, kernel_size=1),
+            nn.ReLU(inplace=True),
+        )
+        self.blocks = nn.ModuleList()
+        for i in range(num_depth):
+            if num_depth > 2 > i:
+                block = nn.Sequential(
+                    nn.Conv2d(top_channel * 2 ** (num_depth - i), top_channel * 2 ** (num_depth - i), 3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(top_channel * 2 ** (num_depth - i), top_channel * 2 ** (num_depth - i - 1), 3, padding=1),
+                    nn.ReLU(inplace=True),
+                )
+            else:
+                block = nn.Sequential(
+                    nn.Conv2d(top_channel * 2 ** (num_depth - i),  top_channel * 2 ** (num_depth - i), 3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(top_channel * 2 ** (num_depth - i),  top_channel * 2 ** (num_depth - i), 3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.ConvTranspose2d(top_channel * 2 ** (num_depth - i), top_channel * 2 ** (num_depth - i - 1), 2, stride=2),
+                )
+            self.blocks.append(block)
+
+        self.final = nn.Sequential(
+            nn.Conv2d(top_channel+p_channel, int(top_channel), 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(top_channel, num_classes, 3, padding=1),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            nn.Conv2d(num_classes, num_classes, 1),
+        )
+
+    def forward(self, x, p):
+        if self.first_p:
+            x = self.input_block(x)
+            for blk in self.blocks:
+                x = blk(x)
+            y = torch.cat([x, p], 1)
+            y = self.final(y)
+        else:
+            x = torch.cat([x, p], 1)
+            x = self.input_block(x)
+            for blk in self.blocks:
+                x = blk(x)
+            y = self.final(x)
+
+        return y

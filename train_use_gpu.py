@@ -62,8 +62,8 @@ parser.add_argument("--num_classes", type=int, default=2, required=False,)
 parser.add_argument("--save_dir", type=str, default='', required=False,)
 parser.add_argument("--load_saved_model", action='store_true',
                     help='whether freeze encoder of the segmenter')
-parser.add_argument('--model_type', type=str, default="vit_l", required=False,
-                    help='Model key: vit_b, vit_l, vit_h (legacy) or vit_b_hardnet, vit_l_hardnet, vit_h_hardnet (HardNet first stage).')
+parser.add_argument('--model_type', type=str, default="vit_b_hardnet", required=False,
+                    help='Model key: vit_b_hardnet, vit_l_hardnet, vit_h_hardnet (HardNet first stage).')
 parser.add_argument('--input_channels', type=int, default=1, choices=[1, 3],
                     help='Input channels: 1 for grayscale MRI (recommended), 3 for RGB.')
 parser.add_argument('--format_img', type=str, default='.tif', required=False, help='')
