@@ -65,7 +65,7 @@ def _adapt_sam_patch_embed_in_channels(image_encoder, input_channels):
     image_encoder.patch_embed.proj = new_proj
 
 
-def _load_checkpoint_safely(model, checkpoint_path, encoder_global_attn_indexes):
+def load_checkpoint_safely(model, checkpoint_path, encoder_global_attn_indexes):
     """Load only compatible checkpoint tensors; adapt SAM patch-embed 3->1 when needed."""
     with open(checkpoint_path, "rb") as f:
         state_dict = torch.load(f, weights_only=False)
@@ -208,7 +208,7 @@ def _build_feat_seg_model_hardnet(
     )
 
     if checkpoint is not None:
-        _load_checkpoint_safely(
+        load_checkpoint_safely(
             sam_seg,
             checkpoint,
             encoder_global_attn_indexes=encoder_global_attn_indexes,

@@ -11,7 +11,7 @@ from segment_anything.modeling import ImageEncoderViT, PromptEncoder, TwoWayTran
 from .build_sam_feat_seg_model import _adapt_sam_patch_embed_in_channels, _resize_sam_pos_embed, _is_global_rel_pos_key, _resize_sam_rel_pos
 
 
-def _load_checkpoint_safely_unet(model, checkpoint_path, encoder_global_attn_indexes):
+def load_checkpoint_safely_unet(model, checkpoint_path, encoder_global_attn_indexes):
     """Load matching tensors from SAM/HardNet checkpoints to the new UNet architecture."""
     with open(checkpoint_path, "rb") as f:
         state_dict = torch.load(f, weights_only=False)
@@ -182,7 +182,7 @@ def _build_feat_seg_model_hardnet_unet(
     )
 
     if checkpoint is not None:
-        _load_checkpoint_safely_unet(
+        load_checkpoint_safely_unet(
             sam_seg,
             checkpoint,
             encoder_global_attn_indexes=encoder_global_attn_indexes,

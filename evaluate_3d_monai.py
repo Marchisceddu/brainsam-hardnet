@@ -6,6 +6,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Dict, List, Tuple
 
 import albumentations as albu
@@ -16,7 +17,13 @@ from monai.metrics import DiceMetric, HausdorffDistanceMetric
 from torch.utils import data
 from tqdm import tqdm
 
-from models import sam_feat_seg_model_registry
+from models import (
+    sam_feat_seg_model_registry,
+    sam_unet_model_registry,
+    load_checkpoint_safely,
+    load_checkpoint_safely_unet,
+)
+from lora_layers import inject_lora_sam
 
 
 FILENAME_RE = re.compile(r"^(P\d+)_(T\d+)_(\d+)\.[^.]+$")
@@ -176,6 +183,70 @@ class SliceDataset(torch.utils.data.Dataset):
         }
 
 
+def _parse_vit_lora_targets(targets: str) -> Dict[str, bool]:
+    """Translate CLI target aliases into the keys expected by lora_layers.py."""
+    alias_to_key = {
+        "q": "q_proj",
+        "q_proj": "q_proj",
+        "k": "k_proj",
+        "k_proj": "k_proj",
+        "v": "v_proj",
+        "v_proj": "v_proj",
+        "out": "out_proj",
+        "proj": "out_proj",
+        "out_proj": "out_proj",
+        "mlp1": "mlp_lin1",
+        "mlp_lin1": "mlp_lin1",
+        "mlp2": "mlp_lin2",
+        "mlp_lin2": "mlp_lin2",
+        "all": "all",
+    }
+    supported_keys = ["q_proj", "k_proj", "v_proj", "out_proj", "mlp_lin1", "mlp_lin2"]
+    selected = set()
+
+    for token in (part.strip().lower() for part in targets.split(",")):
+        if not token:
+            continue
+        if token not in alias_to_key:
+            raise ValueError(
+                f"Unknown LoRA target '{token}'. Supported values: q, k, v, out, mlp1, mlp2, all."
+            )
+        mapped = alias_to_key[token]
+        if mapped == "all":
+            selected.update(supported_keys)
+        else:
+            selected.add(mapped)
+
+    if not selected:
+        raise ValueError("At least one LoRA target must be selected.")
+
+    return {key: key in selected for key in supported_keys}
+
+
+def _build_vit_lora_cfg(args):
+    """Build the minimal config object expected by inject_lora_sam()."""
+    encoder_targets = _parse_vit_lora_targets(args.lora_vit_targets)
+
+    return SimpleNamespace(
+        encoder=SimpleNamespace(
+            enabled=args.lora_vit,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            lora_bias=args.lora_bias,
+            lora_targets=encoder_targets,
+        ),
+        decoder=SimpleNamespace(
+            enabled=False,
+            lora_r=0,
+            lora_alpha=0.0,
+            lora_dropout=0.0,
+            lora_bias=False,
+            lora_targets={},
+        ),
+    )
+
+
 @dataclass
 class VolumeResult:
     patient: str
@@ -262,7 +333,17 @@ def build_argparser() -> argparse.ArgumentParser:
         "--model_type",
         type=str,
         default="vit_l_hardnet",
-        choices=["vit_b", "vit_l", "vit_h", "vit_b_hardnet", "vit_l_hardnet", "vit_h_hardnet"],
+        choices=[
+            "vit_b",
+            "vit_l",
+            "vit_h",
+            "vit_b_hardnet",
+            "vit_l_hardnet",
+            "vit_h_hardnet",
+            "vit_b_hardnet_unet",
+            "vit_l_hardnet_unet",
+            "vit_h_hardnet_unet",
+        ],
     )
     p.add_argument("--num_classes", type=int, default=2)
     p.add_argument("--input_channels", type=int, default=1, choices=[1, 3])
@@ -271,6 +352,26 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--img_glob", type=str, default="*.tif", help="Glob pattern for test images")
+
+    # LoRA arguments
+    p.add_argument(
+        "--lora_vit",
+        action="store_true",
+        help="Enable LoRA adapters in the SAM ViT image encoder.",
+    )
+    p.add_argument(
+        "--lora_vit_targets",
+        type=str,
+        default="q,v,mlp1,mlp2",
+        help="Comma-separated LoRA targets (q,k,v,out,mlp1,mlp2).",
+    )
+    p.add_argument("--lora_r", type=int, default=8, help="LoRA rank.")
+    p.add_argument("--lora_alpha", type=float, default=16.0, help="LoRA alpha.")
+    p.add_argument("--lora_dropout", type=float, default=0.0, help="LoRA dropout.")
+    p.add_argument(
+        "--lora_bias", action="store_true", help="Use bias in LoRA adapters."
+    )
+
     p.add_argument(
         "--eval_stage",
         type=str,
@@ -308,13 +409,47 @@ def main(args):
         drop_last=False,
     )
 
-    model = sam_feat_seg_model_registry[args.model_type](
-        num_classes=args.num_classes,
-        checkpoint=args.model_path,
-        img_size=args.img_size,
-        iter_2stage=args.iter_2stage,
-        input_channels=args.input_channels,
-    )
+    # ── Model setup ──
+    is_unet = args.model_type.endswith("_unet")
+    registry = sam_unet_model_registry if is_unet else sam_feat_seg_model_registry
+    loader_fn = load_checkpoint_safely_unet if is_unet else load_checkpoint_safely
+
+    # Global attention indexes needed for positional embedding resizing during loading
+    if "vit_b" in args.model_type:
+        encoder_global_attn_indexes = [2, 5, 8, 11]
+    elif "vit_l" in args.model_type:
+        encoder_global_attn_indexes = [5, 11, 17, 23]
+    elif "vit_h" in args.model_type:
+        encoder_global_attn_indexes = [7, 15, 23, 31]
+    else:
+        encoder_global_attn_indexes = []
+
+    if args.lora_vit:
+        # Load without weights first, inject LoRA, then load weights safely.
+        model = registry[args.model_type](
+            num_classes=args.num_classes,
+            checkpoint=None,
+            img_size=args.img_size,
+            iter_2stage=args.iter_2stage,
+            input_channels=args.input_channels,
+        )
+        lora_cfg = _build_vit_lora_cfg(args)
+        model = inject_lora_sam(model, lora_cfg)
+        loader_fn(
+            model,
+            args.model_path,
+            encoder_global_attn_indexes=encoder_global_attn_indexes,
+        )
+    else:
+        # Standard loading via registry
+        model = registry[args.model_type](
+            num_classes=args.num_classes,
+            checkpoint=args.model_path,
+            img_size=args.img_size,
+            iter_2stage=args.iter_2stage,
+            input_channels=args.input_channels,
+        )
+
     model.to(device)
     model.eval()
 
