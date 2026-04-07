@@ -741,6 +741,31 @@ def main_worker(args):
 
     norm_mean, norm_std = get_brain_aware_zscore_stats(img_paths_for_stats, args.input_channels, args.format_img)
 
+
+    '''
+        # === GEOMETRICHE ===
+        albu.HorizontalFlip(p=0.5),
+        albu.VerticalFlip(p=0.5),
+        albu.RandomRotate90(p=0.5),
+        albu.Affine(
+            translate_percent=0.1, scale=(0.85, 1.15), rotate=(-15, 15),
+            border_mode=cv2.BORDER_CONSTANT, fill=0, fill_mask=0, p=0.5
+        ),
+        albu.ElasticTransform(
+            alpha=120, sigma=120 * 0.05,
+            border_mode=cv2.BORDER_CONSTANT, fill=0, fill_mask=0,
+            p=0.2
+        ),
+        # === INTENSITÀ ===
+        albu.RandomBrightnessContrast(
+            brightness_limit=0.15, contrast_limit=0.15, p=0.3
+        ),
+        albu.RandomGamma(gamma_limit=(80, 120), p=0.3),
+        albu.GaussNoise(std_range=(0.02, 0.15), p=0.15),
+        albu.GaussianBlur(blur_limit=(3, 5), p=0.1),
+        # === NORMALIZZAZIONE ===
+    '''
+
     train_transform = albu.Compose([
         albu.LongestMaxSize(max_size=args.img_size),
         albu.PadIfNeeded(
@@ -753,24 +778,6 @@ def main_worker(args):
         # === GEOMETRICHE ===
         albu.HorizontalFlip(p=0.5),
         albu.VerticalFlip(p=0.5),
-        albu.RandomRotate90(p=0.5),
-        albu.ShiftScaleRotate(
-            shift_limit=0.1, scale_limit=0.15, rotate_limit=15,
-            border_mode=cv2.BORDER_CONSTANT, value=0, mask_value=0, p=0.5
-        ),
-        albu.ElasticTransform(
-            alpha=120, sigma=120 * 0.05,
-            border_mode=cv2.BORDER_CONSTANT, value=0, mask_value=0,
-            p=0.2
-        ),
-        # === INTENSITÀ ===
-        albu.RandomBrightnessContrast(
-            brightness_limit=0.15, contrast_limit=0.15, p=0.3
-        ),
-        albu.RandomGamma(gamma_limit=(80, 120), p=0.3),
-        albu.GaussNoise(var_limit=(5.0, 30.0), p=0.15),
-        albu.GaussianBlur(blur_limit=(3, 5), p=0.1),
-        # === NORMALIZZAZIONE ===
         albu.Normalize(
             mean=norm_mean,
             std=norm_std,
@@ -1176,7 +1183,7 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
     # ── Compute 3D volume-wise DSC (if metadata available) ──
     val_dsc_3d_macro_stage1 = float('nan')
     val_dsc_3d_micro_stage1 = float('nan')
-    val_dsc_3d_macro_stage1 = float('nan')
+    val_dsc_3d_macro_stage2 = float('nan')
     val_dsc_3d_micro_stage2 = float('nan')
     num_volumes_3d = 0
     
