@@ -37,15 +37,15 @@ except Exception:
 
 parser = argparse.ArgumentParser(description='PyTorch Brain-SAM Training')
 
-parser.add_argument('--epochs', default=50, type=int, required=False,
+parser.add_argument('--epochs', default=300, type=int, required=False,
                     help='number of total epochs to run')
 parser.add_argument('--start_epoch', default=30, type=int, required=False,
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('--batch_size', default=4, type=int, required=False,
+parser.add_argument('--batch_size', default=2, type=int, required=False,
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
                          'using Data Parallel or Distributed Data Parallel')
-parser.add_argument('--lr', default=0.0003, type=float, required=False,
+parser.add_argument('--lr', default=0.01, type=float, required=False,
                     metavar='LR', help='initial learning rate')
 parser.add_argument('--weight_decay', default=1e-4, type=float, required=False,
                     metavar='W', help='weight decay (default: 1e-4)',)
@@ -63,7 +63,7 @@ parser.add_argument("--num_classes", type=int, default=2, required=False,)
 parser.add_argument("--save_dir", type=str, default='', required=False,)
 parser.add_argument("--load_saved_model", action='store_true',
                     help='whether freeze encoder of the segmenter')
-parser.add_argument('--model_type', type=str, default="vit_b_hardnet", required=False,
+parser.add_argument('--model_type', type=str, default="vit_b_hardnet_unet", required=False,
                 help='Model key: vit_b_hardnet, vit_l_hardnet, vit_h_hardnet, '
                     'vit_b_hardnet_unet, vit_l_hardnet_unet, vit_h_hardnet_unet, '
                     'vit_b_hardnet_unet_cnn, vit_l_hardnet_unet_cnn, vit_h_hardnet_unet_cnn.')
@@ -99,7 +99,7 @@ parser.add_argument('--loss_type', type=str, default='DiceCE',
                          'DiceCE is recommended for small-lesion segmentation (e.g. MS).')
 
 # Gradient accumulation
-parser.add_argument('--accum_steps', default=1, type=int,
+parser.add_argument('--accum_steps', default=8, type=int,
                     help='Number of gradient accumulation steps. '
                          'Effective batch size = batch_size × accum_steps (× num_gpus if distributed). '
                          'Increase this to simulate larger batches without extra GPU memory. '
@@ -133,16 +133,18 @@ parser.add_argument('--use_tensorboard', action='store_true',
                 help='Enable TensorBoard logging (disabled by default to avoid TensorFlow startup warnings).')
 
 # Scheduler parameters
-parser.add_argument('--lr_scheduler', type=str, default='plateau', choices=['step', 'plateau', 'both'],
-                help='Which learning rate scheduler to use (step, plateau, or both).')
+parser.add_argument('--lr_scheduler', type=str, default='poly', choices=['step', 'plateau', 'both', 'poly', 'cosine'],
+                help='Which learning rate scheduler to use (step, plateau, both, poly, or cosine).')
 parser.add_argument('--plateau_patience', type=int, default=3,
                 help='Patience for ReduceLROnPlateau scheduler.')
 parser.add_argument('--plateau_factor', type=float, default=0.5,
                 help='Factor for ReduceLROnPlateau scheduler.')
 
 # Optimizer
-parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw'],
-                help='Which optimizer to use (adam or adamw).')
+parser.add_argument('--optimizer', type=str, default='sgd', choices=['adam', 'adamw', 'sgd'],
+                help='Which optimizer to use (adam, adamw, or sgd).')
+parser.add_argument('--clip_grad', type=float, default=0.0,
+                help='Max norm for gradient clipping. Set to 0.0 to disable.')
 
 # LoRA only for the SAM ViT image encoder.
 parser.add_argument('--lora_vit', action='store_true',
@@ -585,6 +587,14 @@ def main_worker(args):
             lr=args.lr,
             weight_decay=args.weight_decay,
         )
+    elif args.optimizer.lower() == 'sgd':
+        optimizer = torch.optim.SGD(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=args.lr,
+            momentum=0.99,
+            nesterov=True,
+            weight_decay=args.weight_decay,
+        )
     else:
         optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, model.parameters()),
@@ -592,17 +602,27 @@ def main_worker(args):
             weight_decay=args.weight_decay,
         )
     
+    scheduler_step = None
+    scheduler_plateau = None
+    
     if args.lr_scheduler in ['step', 'both']:
         scheduler_step = torch.optim.lr_scheduler.StepLR(optimizer, step_size=8, gamma=0.5)
-    else:
-        scheduler_step = None
         
     if args.lr_scheduler in ['plateau', 'both']:
         scheduler_plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='max', patience=args.plateau_patience, factor=args.plateau_factor
         )
-    else:
-        scheduler_plateau = None
+        
+    if args.lr_scheduler == 'poly':
+        scheduler_step = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda epoch: (1 - epoch / args.epochs) ** 0.9
+        )
+        
+    if args.lr_scheduler == 'cosine':
+        scheduler_step = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=1e-6
+        )
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -730,8 +750,27 @@ def main_worker(args):
             fill=0,
             fill_mask=0,
         ),
+        # === GEOMETRICHE ===
         albu.HorizontalFlip(p=0.5),
         albu.VerticalFlip(p=0.5),
+        albu.RandomRotate90(p=0.5),
+        albu.ShiftScaleRotate(
+            shift_limit=0.1, scale_limit=0.15, rotate_limit=15,
+            border_mode=cv2.BORDER_CONSTANT, value=0, mask_value=0, p=0.5
+        ),
+        albu.ElasticTransform(
+            alpha=120, sigma=120 * 0.05,
+            border_mode=cv2.BORDER_CONSTANT, value=0, mask_value=0,
+            p=0.2
+        ),
+        # === INTENSITÀ ===
+        albu.RandomBrightnessContrast(
+            brightness_limit=0.15, contrast_limit=0.15, p=0.3
+        ),
+        albu.RandomGamma(gamma_limit=(80, 120), p=0.3),
+        albu.GaussNoise(var_limit=(5.0, 30.0), p=0.15),
+        albu.GaussianBlur(blur_limit=(3, 5), p=0.1),
+        # === NORMALIZZAZIONE ===
         albu.Normalize(
             mean=norm_mean,
             std=norm_std,
@@ -1021,7 +1060,8 @@ def train(train_loader, model, optimizer, epoch, args, writer, device, criterion
             loss = loss / accum_steps
             loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        if args.clip_grad > 0.0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.clip_grad)
 
         iou_stage1_sum += iou_score(mask, img_out1_for_loss)
         dsc_stage1_sum += dsc_score(mask, img_out1_for_loss)
@@ -1116,7 +1156,7 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
                     'img': img[:max_n].detach().cpu(),
                     'mask': mask[:max_n].detach().cpu(),
                     'out1': img_out1[:max_n].detach().cpu(),
-                    'out2': img_out[:max_n].detach().cpu(),
+                    'out2': img_out1[:max_n].detach().cpu(),
                 }
 
     # ── Synchronize validation metrics across all GPUs ──
@@ -1195,7 +1235,7 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
                 global_fn_s2 += int(np.logical_and(np.logical_not(pred2_fg), gt_fg).sum())
             
             val_dsc_3d_macro_stage1 = float(np.nanmean(dsc_3d_values_s1)) if dsc_3d_values_s1 else float('nan')
-            val_dsc_3d_macro_stage1 = float(np.nanmean(dsc_3d_values_s2)) if dsc_3d_values_s2 else float('nan')
+            val_dsc_3d_macro_stage2 = float(np.nanmean(dsc_3d_values_s2)) if dsc_3d_values_s2 else float('nan')
             
             # Micro DSC from global TP/FP/FN
             if (global_tp_s1 + global_fp_s1 + global_fn_s1) > 0:
@@ -1208,7 +1248,7 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
         if num_volumes_3d > 0:
             print(f'epoch[{epoch}]: val_dsc_3d_macro_stage1 (per-volume) = {val_dsc_3d_macro_stage1:.4f} ({num_volumes_3d} volumes)')
             print(f'epoch[{epoch}]: val_dsc_3d_micro_stage1 (global) = {val_dsc_3d_micro_stage1:.4f}')
-            print(f'epoch[{epoch}]: val_dsc_3d_macro_stage1 (per-volume) = {val_dsc_3d_macro_stage1:.4f} ({num_volumes_3d} volumes)')
+            print(f'epoch[{epoch}]: val_dsc_3d_macro_stage2 (per-volume) = {val_dsc_3d_macro_stage2:.4f} ({num_volumes_3d} volumes)')
             print(f'epoch[{epoch}]: val_dsc_3d_micro_stage2 (global) = {val_dsc_3d_micro_stage2:.4f}')
 
         if writer is not None:
@@ -1216,13 +1256,13 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
             if num_volumes_3d > 0:
                 writer.add_scalar("val_dsc_3d_macro_stage1", val_dsc_3d_macro_stage1, global_step=epoch)
                 writer.add_scalar("val_dsc_3d_micro_stage1", val_dsc_3d_micro_stage1, global_step=epoch)
-                writer.add_scalar("val_dsc_3d_macro_stage1", val_dsc_3d_macro_stage1, global_step=epoch)
+                writer.add_scalar("val_dsc_3d_macro_stage2", val_dsc_3d_macro_stage2, global_step=epoch)
                 writer.add_scalar("val_dsc_3d_micro_stage2", val_dsc_3d_micro_stage2, global_step=epoch)
 
     return val_loss, {
         "val/dsc_3d_macro_stage1": val_dsc_3d_macro_stage1,
         "val/dsc_3d_micro_stage1": val_dsc_3d_micro_stage1,
-        "val/dsc_3d_macro_stage2": val_dsc_3d_macro_stage1,
+        "val/dsc_3d_macro_stage2": val_dsc_3d_macro_stage2,
         "val/dsc_3d_micro_stage2": val_dsc_3d_micro_stage2,
     }, vis_dict
 
