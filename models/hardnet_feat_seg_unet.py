@@ -1,6 +1,26 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn.functional as F
+
+
+class LearnablePromptRefiner(nn.Module):
+    """
+    Raffina i logits grezzi dello stage 1 per generare un mask-prompt più pulito
+    e semanticamente coerente rispetto a una semplice operazione di clamp/sigmoid.
+    """
+    def __init__(self, in_channels=1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, kernel_size=3, padding=1),
+            nn.Sigmoid()  # output ranges [0, 1] as required by SAM prompt encoder
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 
 class HardNetFeatSegUNet(nn.Module):
@@ -20,6 +40,7 @@ class HardNetFeatSegUNet(nn.Module):
         self.hardnet_unet_stage = hardnet_unet_stage
         self.prompt_encoder = prompt_encoder
         self.sam_unet_decoder = sam_unet_decoder
+        self.prompt_refiner = LearnablePromptRefiner(in_channels=1)
 
     @property
     def mask_decoder(self):
@@ -62,11 +83,11 @@ class HardNetFeatSegUNet(nn.Module):
         out_d = out1
 
         for _ in range(self.iter_2stage):
-            # Sigmoid e selezione canali (nel caso num_classes > 1 prendiamo il canale foreground)
+            # Learnable Prompt Refiner in sostituzione della semplice sigmoid
             if out_d.shape[1] > 1:
-                p_in = torch.sigmoid(out_d[:, 1:2, ...])
+                p_in = self.prompt_refiner(out_d[:, 1:2, ...])
             else:
-                p_in = torch.sigmoid(out_d)
+                p_in = self.prompt_refiner(out_d)
 
             # Evita interpolazioni inutili se la risoluzione e' gia' corretta.
             target_mask_size = self.prompt_encoder.mask_input_size

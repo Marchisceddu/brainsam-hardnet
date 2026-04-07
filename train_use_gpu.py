@@ -19,6 +19,7 @@ import torch.optim
 import torch.utils.data
 import torch.utils.data.distributed
 import torch.distributed as dist
+import json
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils import data
@@ -574,8 +575,10 @@ def main_worker(args):
     if args.distributed:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
-    optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=args.lr,
+        weight_decay=1e-2,
     )
     
     if args.lr_scheduler in ['step', 'both']:
@@ -618,15 +621,94 @@ def main_worker(args):
 
     cudnn.benchmark = True
 
-    # ── Data loading ──
-    # Resize preserving aspect ratio, then pad to square with black borders.
-    # Normalization uses ImageNet mean/std to match SAM's frozen encoder pretraining.
-    # mean=[0.485, 0.456, 0.406]
-    # std=[0.229, 0.224, 0.225]
-    if args.input_channels == 1:
-        norm_mean, norm_std = [0.5], [0.5]
+    def get_brain_aware_zscore_stats(img_paths, input_channels, format_img, stats_file="brain_zscore_stats.json"):
+        if os.path.exists(stats_file):
+            with open(stats_file, 'r') as f:
+                stats = json.load(f)
+                return stats['mean'], stats['std']
+        
+        import cv2
+        from PIL import Image
+        
+        print(f"Calculating global brain-aware Z-score on {len(img_paths)} images...")
+        
+        sums = np.zeros(input_channels, dtype=np.float64)
+        sum_sq = np.zeros(input_channels, dtype=np.float64)
+        pixel_count = 0
+        
+        for path in tqdm(img_paths, desc="Brain Z-score calc"):
+            img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+            if img is None:
+                if path.endswith('.tif'):
+                    import tifffile
+                    img = tifffile.imread(path)
+                else:
+                    img = np.array(Image.open(path))
+            
+            if len(img.shape) == 2:
+                img = img[..., None]
+                
+            if len(img.shape) == 3 and img.shape[2] == 3 and img.dtype == np.uint8:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                
+            if input_channels == 1:
+                if img.shape[2] == 3:
+                    img = cv2.cvtColor(img.astype(np.uint8), cv2.COLOR_RGB2GRAY)[..., None]
+                elif img.shape[2] != 1:
+                    img = img.mean(axis=2, keepdims=True)
+            elif input_channels == 3:
+                if img.shape[2] == 1:
+                    img = np.repeat(img, 3, axis=2)
+                elif img.shape[2] > 3:
+                    img = img[:, :, :3]
+                    
+            img = img.astype(np.float32)
+            v_min, v_max = img.min(), img.max()
+            if v_max > 255.0 or v_min < 0.0:
+                if v_max - v_min > 1e-8:
+                    img = (img - v_min) / (v_max - v_min) * 255.0
+                else:
+                    img = np.zeros_like(img, dtype=np.float32)
+                    
+            # Brain mask: considera pixel non-neri
+            brain_mask = img.sum(axis=-1) > 0  
+            if not np.any(brain_mask):
+                continue
+                
+            pixels = img[brain_mask]
+            sums += pixels.sum(axis=0)
+            sum_sq += (pixels ** 2).sum(axis=0)
+            pixel_count += pixels.shape[0]
+            
+        if pixel_count == 0:
+            mean = [0.5] * input_channels
+            std = [0.5] * input_channels
+        else:
+            mean = (sums / pixel_count).tolist()
+            var = (sum_sq / pixel_count) - (sums / pixel_count) ** 2
+            std = np.sqrt(np.maximum(var, 1e-6)).tolist()
+            
+        mean = [m / 255.0 for m in mean]
+        std = [s / 255.0 for s in std]
+        
+        if is_main_process():
+            with open(stats_file, 'w') as f:
+                json.dump({'mean': mean, 'std': std}, f)
+            print(f"Calculated Z-score stats: mean={mean}, std={std}")
+        return mean, std
+
+    use_separate_dirs = bool(args.train_img_path and args.val_img_path)
+
+    if use_separate_dirs:
+        img_paths_for_stats = glob.glob(os.path.join(args.train_img_path, args.format_img_glob))
     else:
-        norm_mean, norm_std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+        img_names = glob.glob(os.path.join(args.img_path, args.format_img_glob))
+        base_names = [os.path.basename(x).split('.')[0] for x in img_names]
+        from sklearn.model_selection import train_test_split
+        train_names, val_names = train_test_split(base_names, train_size=0.8, random_state=42)
+        img_paths_for_stats = [os.path.join(args.img_path, n + args.format_img) for n in train_names]
+
+    norm_mean, norm_std = get_brain_aware_zscore_stats(img_paths_for_stats, args.input_channels, args.format_img)
 
     train_transform = albu.Compose([
         albu.LongestMaxSize(max_size=args.img_size),
@@ -662,8 +744,6 @@ def main_worker(args):
         ),
     ], is_check_shapes=False)
 
-    use_separate_dirs = bool(args.train_img_path and args.val_img_path)
-
     if use_separate_dirs:
         # ── Separate train/val directories (recommended) ──
         train_img_dir = args.train_img_path
@@ -687,11 +767,6 @@ def main_worker(args):
                           img_dir=val_img_dir, mask_dir=val_lbl_dir)
     else:
         # ── Legacy mode: single directory with 80/20 split ──
-        from sklearn.model_selection import train_test_split
-        img_names = glob.glob(os.path.join(args.img_path, args.format_img_glob))
-        base_names = [os.path.basename(x).split('.')[0] for x in img_names]
-        train_names, val_names = train_test_split(base_names, train_size=0.8, random_state=42)
-
         if is_main_process():
             print(f"Using legacy single-directory mode with 80/20 split:")
             print(f"  Train: {len(train_names)} / Val: {len(val_names)}")
@@ -934,10 +1009,10 @@ def train(train_loader, model, optimizer, epoch, args, writer, device, criterion
                 loss = criterion(img_out_for_loss, mask_monai) * 0.3 + \
                        criterion(img_out1_for_loss, mask_monai) * 0.7
 
-            # Scale loss so that gradient magnitude stays consistent
-            # regardless of the number of accumulation steps.
             loss = loss / accum_steps
             loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
         iou_stage1_sum += iou_score(mask, img_out1_for_loss)
         iou_stage2_sum += iou_score(mask, img_out_for_loss)
@@ -1014,10 +1089,10 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
             img_out_for_loss = _ensure_multiclass_logits(img_out, args.num_classes)
 
             if use_ce:
-                loss = criterion(img_out_for_loss, mask) * 0.3 + criterion(img_out1_for_loss, mask) * 0.7
+                loss = criterion(img_out_for_loss, mask) * 0.7 + criterion(img_out1_for_loss, mask) * 0.3
             else:
                 mask_monai = mask.unsqueeze(1).float()
-                loss = criterion(img_out_for_loss, mask_monai) * 0.3 + criterion(img_out1_for_loss, mask_monai) * 0.7
+                loss = criterion(img_out_for_loss, mask_monai) * 0.7 + criterion(img_out1_for_loss, mask_monai) * 0.3
 
             val_loss_sum += loss.item()
             num_batches += 1
