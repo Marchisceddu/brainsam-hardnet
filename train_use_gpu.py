@@ -1089,10 +1089,10 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
             img_out_for_loss = _ensure_multiclass_logits(img_out, args.num_classes)
 
             if use_ce:
-                loss = criterion(img_out_for_loss, mask) * 0.7 + criterion(img_out1_for_loss, mask) * 0.3
+                loss = criterion(img_out_for_loss, mask) * 0.3 + criterion(img_out1_for_loss, mask) * 0.7
             else:
                 mask_monai = mask.unsqueeze(1).float()
-                loss = criterion(img_out_for_loss, mask_monai) * 0.7 + criterion(img_out1_for_loss, mask_monai) * 0.3
+                loss = criterion(img_out_for_loss, mask_monai) * 0.3 + criterion(img_out1_for_loss, mask_monai) * 0.7
 
             val_loss_sum += loss.item()
             num_batches += 1
