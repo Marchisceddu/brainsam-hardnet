@@ -563,12 +563,12 @@ def main_worker(args):
             active_targets = [name for name, enabled in lora_cfg.encoder.lora_targets.items() if enabled]
             print(f"LoRA enabled for ViT encoder with targets: {', '.join(active_targets)}")
     else:
-        # Preserve the original behavior when LoRA is disabled.
+        # For stage 1, freeze everything EXCEPT hardnet_unet_stage
         for name, param in model.named_parameters():
-            if "image_encoder" in name:
+            if not name.startswith("hardnet_unet_stage"):
                 param.requires_grad = False
         if is_main_process():
-            print("LoRA disabled; SAM image encoder remains frozen.")
+            print("Stage 1 Training: Frozen all components except hardnet_unet_stage")
 
     if is_main_process():
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -858,7 +858,7 @@ def main_worker(args):
                   f"→ effective batch size = {eff_bs}")
 
     best_loss = float('inf')
-    best_dsc_3d_macro_stage2 = float('-inf')
+    best_dsc_3d_macro_stage1 = float('-inf')
     use_3d_dsc_selection = False  # Will be True after first validation with valid 3D DSC
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -883,10 +883,10 @@ def main_worker(args):
                             wandb_run=wandb_run)
 
         # Extract 3D DSC if available
-        val_dsc_3d_macro_stage2 = val_metrics.get("val/dsc_3d_macro_stage2", float('nan'))
+        val_dsc_3d_macro_stage1 = val_metrics.get("val/dsc_3d_macro_stage2", float('nan'))
         
         # Determine if we have valid 3D DSC for checkpoint selection
-        has_valid_3d_dsc = not (np.isnan(val_dsc_3d_macro_stage2) or np.isinf(val_dsc_3d_macro_stage2))
+        has_valid_3d_dsc = not (np.isnan(val_dsc_3d_macro_stage1) or np.isinf(val_dsc_3d_macro_stage1))
         if has_valid_3d_dsc:
             use_3d_dsc_selection = True
 
@@ -901,8 +901,8 @@ def main_worker(args):
             total_payload.update(train_metrics)
             total_payload.update(val_metrics)
 
-            if use_3d_dsc_selection and has_valid_3d_dsc and val_dsc_3d_macro_stage2 > best_dsc_3d_macro_stage2:
-                total_payload["val/best_dsc_3d_macro_stage2"] = val_dsc_3d_macro_stage2
+            if use_3d_dsc_selection and has_valid_3d_dsc and val_dsc_3d_macro_stage1 > best_dsc_3d_macro_stage1:
+                total_payload["val/best_dsc_3d_macro_stage1"] = val_dsc_3d_macro_stage1
             elif not use_3d_dsc_selection and val_loss < best_loss:
                 total_payload["val/best_loss"] = val_loss
 
@@ -927,7 +927,7 @@ def main_worker(args):
             scheduler_step.step()
         if scheduler_plateau is not None:
             if has_valid_3d_dsc:
-                scheduler_plateau.step(val_dsc_3d_macro_stage2)
+                scheduler_plateau.step(val_dsc_3d_macro_stage1)
             else:
                 # If no valid 3D DSC, we don't step the plateau scheduler
                 # for now, as it is configured in 'max' mode for DSC.
@@ -937,8 +937,8 @@ def main_worker(args):
         is_best_epoch = False
         if is_main_process():
             if use_3d_dsc_selection and has_valid_3d_dsc:
-                if val_dsc_3d_macro_stage2 > best_dsc_3d_macro_stage2:
-                    best_dsc_3d_macro_stage2 = val_dsc_3d_macro_stage2
+                if val_dsc_3d_macro_stage1 > best_dsc_3d_macro_stage1:
+                    best_dsc_3d_macro_stage1 = val_dsc_3d_macro_stage1
                     is_best_epoch = True
             else:
                 if val_loss < best_loss:
@@ -946,7 +946,7 @@ def main_worker(args):
                     is_best_epoch = True
 
         if is_main_process() and is_best_epoch:
-            metric_str = f'val_dsc_3d_macro_stage2 = {val_dsc_3d_macro_stage2:.4f}' if has_valid_3d_dsc else f'val_loss = {val_loss:.6f}'
+            metric_str = f'val_dsc_3d_macro_stage1 = {val_dsc_3d_macro_stage1:.4f}' if has_valid_3d_dsc else f'val_loss = {val_loss:.6f}'
             print(f'save model (best): {metric_str}')
             # save the underlying model state_dict (without DDP wrapper)
             model_state = model.module.state_dict() if args.distributed else model.state_dict()
@@ -1009,16 +1009,14 @@ def train(train_loader, model, optimizer, epoch, args, writer, device, criterion
               contextlib.nullcontext()
 
         with ctx:
-            img_out1, img_out, prompt_embedding = model(img)
+            img_out1, _, _ = model(img, stage1_only=True)
             img_out1_for_loss = _ensure_multiclass_logits(img_out1, args.num_classes)
-            img_out_for_loss = _ensure_multiclass_logits(img_out, args.num_classes)
 
             if use_ce:
-                loss = criterion(img_out_for_loss, mask) * 0.3 + criterion(img_out1_for_loss, mask) * 0.7
+                loss = criterion(img_out1_for_loss, mask)
             else:
                 mask_monai = mask.unsqueeze(1).float()
-                loss = criterion(img_out_for_loss, mask_monai) * 0.3 + \
-                       criterion(img_out1_for_loss, mask_monai) * 0.7
+                loss = criterion(img_out1_for_loss, mask_monai)
 
             loss = loss / accum_steps
             loss.backward()
@@ -1026,9 +1024,7 @@ def train(train_loader, model, optimizer, epoch, args, writer, device, criterion
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
         iou_stage1_sum += iou_score(mask, img_out1_for_loss)
-        iou_stage2_sum += iou_score(mask, img_out_for_loss)
         dsc_stage1_sum += dsc_score(mask, img_out1_for_loss)
-        dsc_stage2_sum += dsc_score(mask, img_out_for_loss)
 
         # Accumulate the *unscaled* loss for logging
         train_loss_sum += loss.item() * accum_steps
@@ -1051,15 +1047,11 @@ def train(train_loader, model, optimizer, epoch, args, writer, device, criterion
         train_loss_sum = reduce_tensor(train_loss_sum, device)
         num_batches = reduce_tensor(num_batches, device)
         iou_stage1_sum = reduce_tensor(iou_stage1_sum, device)
-        iou_stage2_sum = reduce_tensor(iou_stage2_sum, device)
         dsc_stage1_sum = reduce_tensor(dsc_stage1_sum, device)
-        dsc_stage2_sum = reduce_tensor(dsc_stage2_sum, device)
 
     mean_train_loss = train_loss_sum / max(num_batches, 1)
     train_iou_stage1 = iou_stage1_sum / max(num_batches, 1)
-    train_iou_stage2 = iou_stage2_sum / max(num_batches, 1)
     train_dsc_stage1 = dsc_stage1_sum / max(num_batches, 1)
-    train_dsc_stage2 = dsc_stage2_sum / max(num_batches, 1)
     if is_main_process():
         print(f'epoch [{epoch}]: mean_train_loss={mean_train_loss:.6f}')
         if writer is not None:
@@ -1067,9 +1059,7 @@ def train(train_loader, model, optimizer, epoch, args, writer, device, criterion
 
     return mean_train_loss, {
         "train/iou_stage1": train_iou_stage1,
-        "train/iou_stage2": train_iou_stage2,
         "train/dsc_stage1": train_dsc_stage1,
-        "train/dsc_stage2": train_dsc_stage2,
     }
 
 
@@ -1095,15 +1085,14 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
             img = batch['img'].to(device)
             mask = batch['mask'].to(device, dtype=torch.long).squeeze(dim=1)
 
-            img_out1, img_out, prompt_embedding = model(img)
+            img_out1, _, _ = model(img, stage1_only=True)
             img_out1_for_loss = _ensure_multiclass_logits(img_out1, args.num_classes)
-            img_out_for_loss = _ensure_multiclass_logits(img_out, args.num_classes)
 
             if use_ce:
-                loss = criterion(img_out_for_loss, mask) * 0.3 + criterion(img_out1_for_loss, mask) * 0.7
+                loss = criterion(img_out1_for_loss, mask)
             else:
                 mask_monai = mask.unsqueeze(1).float()
-                loss = criterion(img_out_for_loss, mask_monai) * 0.3 + criterion(img_out1_for_loss, mask_monai) * 0.7
+                loss = criterion(img_out1_for_loss, mask_monai)
 
             val_loss_sum += loss.item()
             num_batches += 1
@@ -1111,11 +1100,10 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
             # Collect data for 3D validation (per-volume DSC)
             for i in range(img.shape[0]):
                 pred1_binary = _logits_to_fg_mask(img_out1[i])
-                pred2_binary = _logits_to_fg_mask(img_out[i])
                 gt_binary = mask[i].detach().cpu().numpy().astype(np.uint8)
                 val_loader_data.append({
                     'pred1_binary': pred1_binary,
-                    'pred2_binary': pred2_binary,
+                    'pred2_binary': pred1_binary,  # Fallback per stage1
                     'gt_binary': gt_binary,
                     'patient': batch['patient'][i] if 'patient' in batch else None,
                     'timepoint': batch['timepoint'][i] if 'timepoint' in batch else None,
@@ -1148,7 +1136,7 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
     # ── Compute 3D volume-wise DSC (if metadata available) ──
     val_dsc_3d_macro_stage1 = float('nan')
     val_dsc_3d_micro_stage1 = float('nan')
-    val_dsc_3d_macro_stage2 = float('nan')
+    val_dsc_3d_macro_stage1 = float('nan')
     val_dsc_3d_micro_stage2 = float('nan')
     num_volumes_3d = 0
     
@@ -1207,7 +1195,7 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
                 global_fn_s2 += int(np.logical_and(np.logical_not(pred2_fg), gt_fg).sum())
             
             val_dsc_3d_macro_stage1 = float(np.nanmean(dsc_3d_values_s1)) if dsc_3d_values_s1 else float('nan')
-            val_dsc_3d_macro_stage2 = float(np.nanmean(dsc_3d_values_s2)) if dsc_3d_values_s2 else float('nan')
+            val_dsc_3d_macro_stage1 = float(np.nanmean(dsc_3d_values_s2)) if dsc_3d_values_s2 else float('nan')
             
             # Micro DSC from global TP/FP/FN
             if (global_tp_s1 + global_fp_s1 + global_fn_s1) > 0:
@@ -1220,7 +1208,7 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
         if num_volumes_3d > 0:
             print(f'epoch[{epoch}]: val_dsc_3d_macro_stage1 (per-volume) = {val_dsc_3d_macro_stage1:.4f} ({num_volumes_3d} volumes)')
             print(f'epoch[{epoch}]: val_dsc_3d_micro_stage1 (global) = {val_dsc_3d_micro_stage1:.4f}')
-            print(f'epoch[{epoch}]: val_dsc_3d_macro_stage2 (per-volume) = {val_dsc_3d_macro_stage2:.4f} ({num_volumes_3d} volumes)')
+            print(f'epoch[{epoch}]: val_dsc_3d_macro_stage1 (per-volume) = {val_dsc_3d_macro_stage1:.4f} ({num_volumes_3d} volumes)')
             print(f'epoch[{epoch}]: val_dsc_3d_micro_stage2 (global) = {val_dsc_3d_micro_stage2:.4f}')
 
         if writer is not None:
@@ -1228,13 +1216,13 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
             if num_volumes_3d > 0:
                 writer.add_scalar("val_dsc_3d_macro_stage1", val_dsc_3d_macro_stage1, global_step=epoch)
                 writer.add_scalar("val_dsc_3d_micro_stage1", val_dsc_3d_micro_stage1, global_step=epoch)
-                writer.add_scalar("val_dsc_3d_macro_stage2", val_dsc_3d_macro_stage2, global_step=epoch)
+                writer.add_scalar("val_dsc_3d_macro_stage1", val_dsc_3d_macro_stage1, global_step=epoch)
                 writer.add_scalar("val_dsc_3d_micro_stage2", val_dsc_3d_micro_stage2, global_step=epoch)
 
     return val_loss, {
         "val/dsc_3d_macro_stage1": val_dsc_3d_macro_stage1,
         "val/dsc_3d_micro_stage1": val_dsc_3d_micro_stage1,
-        "val/dsc_3d_macro_stage2": val_dsc_3d_macro_stage2,
+        "val/dsc_3d_macro_stage2": val_dsc_3d_macro_stage1,
         "val/dsc_3d_micro_stage2": val_dsc_3d_micro_stage2,
     }, vis_dict
 

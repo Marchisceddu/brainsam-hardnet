@@ -570,6 +570,12 @@ def main_worker(args):
         if is_main_process():
             print("LoRA disabled; SAM image encoder remains frozen.")
 
+    # STAGE 2: Freeze hardnet_unet_stage
+    for param in model.hardnet_unet_stage.parameters():
+        param.requires_grad = False
+    if is_main_process():
+        print("Stage 2 Training: Frozen hardnet_unet_stage")
+
     if is_main_process():
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in model.parameters())
@@ -1014,11 +1020,10 @@ def train(train_loader, model, optimizer, epoch, args, writer, device, criterion
             img_out_for_loss = _ensure_multiclass_logits(img_out, args.num_classes)
 
             if use_ce:
-                loss = criterion(img_out_for_loss, mask) * 0.3 + criterion(img_out1_for_loss, mask) * 0.7
+                loss = criterion(img_out_for_loss, mask)
             else:
                 mask_monai = mask.unsqueeze(1).float()
-                loss = criterion(img_out_for_loss, mask_monai) * 0.3 + \
-                       criterion(img_out1_for_loss, mask_monai) * 0.7
+                loss = criterion(img_out_for_loss, mask_monai)
 
             loss = loss / accum_steps
             loss.backward()
@@ -1100,10 +1105,10 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
             img_out_for_loss = _ensure_multiclass_logits(img_out, args.num_classes)
 
             if use_ce:
-                loss = criterion(img_out_for_loss, mask) * 0.3 + criterion(img_out1_for_loss, mask) * 0.7
+                loss = criterion(img_out_for_loss, mask)
             else:
                 mask_monai = mask.unsqueeze(1).float()
-                loss = criterion(img_out_for_loss, mask_monai) * 0.3 + criterion(img_out1_for_loss, mask_monai) * 0.7
+                loss = criterion(img_out_for_loss, mask_monai)
 
             val_loss_sum += loss.item()
             num_batches += 1

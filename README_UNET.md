@@ -1,88 +1,109 @@
-# Architettura HardNet-SAM U-Net (`_unet`)
+# Architettura Avanzata HardNet-SAM U-Net (`_unet`)
 
-Questo documento descrive dettagliatamente l'architettura del modello `_unet` (definito come `HardNetFeatSegUNet`), spiegando il ruolo dei vari moduli e il flusso dei dati all'interno della rete. Questo modello combina l'efficienza locale e spaziale di un'architettura U-Net (basata su block HardNet) con le potenti capacità di comprensione del contesto e zero-shot di Segment Anything Model (SAM).
-
-## 1. Diagramma dell'Architettura
-
-Il seguente diagramma Mermaid mostra il flusso dei dati dal momento in cui l'immagine entra nel modello fino alla generazione della maschera finale (Second Stage).
-
-```mermaid
-graph TD
-    subgraph Input
-        X[Immagine Input x]
-    end
-
-    subgraph Branch 1: Primo Stage U-Net
-        X --> HU[HardNetUNetHead]
-        HU -->|mask_logits | MaskProb[Sigmoide: p_in]
-        HU -->|hardnet_dense_features| SamDecoder
-    end
-
-    subgraph Branch 2: SAM Image Features
-        X --> ViT[SAM Image Encoder ViT]
-        ViT -->|image_embeddings| SamDecoder
-    end
-
-    subgraph Branch 3: SAM Prompts
-        MaskProb --> PromptEnc[SAM Prompt Encoder]
-        PromptEnc -->|sparse / dense prompt embeddings| SamDecoder
-        PromptEncPE[SAM Prompt Encoder get_dense_pe] -->|image_pe| SamDecoder
-    end
-
-    subgraph Second Stage & Fusion
-        SamDecoder[SamUNetDecoder]
-        SamDecoder --> MaskDec[SAM Mask Decoder]
-        MaskDec -->|Maschere Raffinate| Loop{iter_2stage?}
-        Loop -- Sì --> PromptEnc
-    end
-
-    Loop -- No --> FinalOut[Out2: Segmentazione Finale]
-    MaskProb --> FirstOut[Out1: Segmentazione Stage 1]
-
-    classDef stage1 fill:#d1e7dd,stroke:#0f5132,stroke-width:2px;
-    classDef sam fill:#cfe2ff,stroke:#084298,stroke-width:2px;
-    classDef fusion fill:#fff3cd,stroke:#664d03,stroke-width:2px;
-
-    class HU,MaskProb,FirstOut stage1;
-    class ViT,PromptEnc,PromptEncPE,MaskDec sam;
-    class SamDecoder,FinalOut fusion;
-```
-
-## 2. Spiegazione delle Variabili (Linee 149-182 di `build_sam_unet_model.py`)
-
-In questa porzione di codice si definiscono e si istanziano i blocchi fondamentali (building blocks) che comporranno il modello finale.
-
-### `mask_decoder = MaskDecoder(...)`
-È il decodificatore nativo di SAM. Sfrutta un Transformer a due vie (Two-Way Transformer) per far interagire i prompt utente (in questo caso, la prima maschera generata in automatico) con i feature embeddings dell'immagine. Il suo unico scopo è restituire una maschera accurata basata principalmente su informazioni globali.
-
-### `sam_unet_dec = SamUNetDecoder(mask_decoder=mask_decoder)`
-È un **wrapper modulare / blocco di fusione** che avvolge il `MaskDecoder` originale. A differenza del SAM standard, questo modulo custom prende in input sia le feature "globali" di SAM (gli *image_embeddings*) sia le feature "locali" molto più dense generate dalla HardNet (*hardnet_dense_features*). Il suo compito è fondere queste informazioni spaziali ad alta risoluzione in modo da permettere a SAM di non perdere i dettagli più piccoli (es. micro lesioni).
-
-### `hardnet_unet_stage = HardNetUNetHead(...)`
-È la rete "First Stage" responsabile dell'estrazione di base. È una U-Net altamente ottimizzata che sfrutta come spina dorsale un modello HardNet (es. HarDNet68/85). Al contrario delle vecchie versioni, questa U-Net non butta via le mappe di feature intermedie, ma restituisce in output **due cose**:
-1. Una prima stima grezza della segmentazione (`mask_logits`).
-2. Una serie di tensori ad alta risoluzione (`hardnet_dense_features`) contenenti i dettagli fini dei bordi e delle texture, che altrimenti SAM perderebbe a causa degli ampi step del ViT (patch size 16x16).
-
-### `sam_seg = HardNetFeatSegUNet(...)`
-Questo è il collante, il **Top Level Model**. Prende tutte le parti appena definite (ViT di SAM, Prompt Encoder, Stage 1 U-Net, Stage 2 Decoder di fusione) e costruisce la pipeline `forward()`. Gestisce le interpolazioni o resize necessari tra i vari branch.
+Questo documento descrive dettagliatamente la nuova architettura migliorata del modello `_unet` (`HardNetFeatSegUNet`). Il modello è stato pesantemente potenziato con moduli di attenzione specializzati per colmare il gap semantico tra la rete di primo stage (estrattore locale) e SAM (comprensione globale), con l'obiettivo specifico di massimizzare la rilevazione di piccole lesioni (come la sclerosi multipla).
 
 ---
 
-## 3. Il Flusso dei Dati (`forward`)
-Quando un'immagine `x` entra nel modello, i dati attraversano il seguente percorso logico:
+## 1. Origini delle Componenti: Letteratura vs. Custom
 
-1. **Elaborazione Parallela Multi-Risoluzione**
-   - **Branch SAM**: L'immagine viene passata nell'`image_encoder` (ViT - Vision Transformer). Questo estrae le rappresentazioni semantiche e contestuali dell'organo o intero distretto in esame (`image_embeddings`).
-   - **Branch U-Net**: La stessa immagine viene analizzata ad alta risoluzione dalla rete `hardnet_unet_stage`. Questa genera subito le `mask_logits` (cioè una prior, una primissima ipotesi su dove si trovi il target) e un dizionario o lista di estrazioni vettoriali (`hardnet_dense_features`).
+L'architettura è un ibrido sofisticato. Di seguito ogni componente chiave, la sua provenienza scientifica e l'obiettivo originale per cui è stato progettato.
 
-2. **Generazione del Mask Prompt**
-   - La primissima predizione di segmentazione (`mask_logits`) viene passata in una funzione Sigmoid prendendo i probabili candidati pixel-perfetti.
-   - Questo output agisce in autonomia da "prompt". Il `prompt_encoder` di SAM lo codifica in matrici compatibili (`sparse_embeddings` e `dense_embeddings`) simulando il modo in cui una persona disegnerebbe una maschera grossolana in input per SAM.
+### Componenti Derivate da Pubblicazioni Scientifiche (State-of-the-Art)
 
-3. **Fusione e Raffinamento (Second Stage)**
-   - Il modulo `sam_unet_decoder` fa la magia: si auto-alimenta dei prompt generati dal modello stesso, recupera le features fini dalla *HardNet* e la macro struttura dallo *SAM ViT*.
-   - Il `mask_decoder` fonde tutto quanto utilizzando strati di attenzione (Cross-attention e Self-attention) e aggiorna la maskera, perfezionando brutalmente lo score sui confini o i falsi negativi/positivi.
+1. **HarDNet Backbone** (*"HarDNet: A Low Memory Traffic Network", Chao et al., 2019*)
+   - **Perché è stato progettato:** Ridurre il traffico di memoria letale per le performance delle CNN mobili, minimizzando il tempo di accesso alla DRAM mantenendo alta l'accuratezza.
+   - **Cosa fa qui:** Funge da encoder ultra-veloce ed efficiente nello Stage 1. Estrae 5 livelli di feature scalate (da $1/2$ a $1/32$ della risoluzione originale).
 
-4. **Iterazioni** (`iter_2stage`)
-   - Se configurato (il "ciclo for" interno), l'architettura riprende l'output appena generato dal secondo stage e lo riutilizza come un *NUOVO prompt* più preciso. Invia la maschera perfezionata ancora una volta al loop producendo risultati progressivamente più nitidi.
-   - Alla fine, restituisce l'`out1` (per la Backpropagation della Loss del First Stage) e `out2` (Output definitivo per calcolo metriche Finali).
+2. **Attention Gate (AG)** (*"Attention U-Net: Learning Where to Look for the Pancreas", Oktay et al., 2018*)
+   - **Perché è stato progettato:** Specifico per il medical imaging. Nelle U-Net classiche le skip-connection propagano feature di basso livello all'encoder, ma portano con sé molto "rumore" del background.
+   - **Cosa fa qui:** Inserito in `models/hardnet_unet_head.py`. Usa il segnale ad alto livello semantico del decoder come "griglia di filtraggio" per spegnere i pixel irrilevanti (la white-matter sana) nelle skip connections e lasciar passare solo la zona target (la lesione).
+
+3. **Multi-Scale Feature Pyramid (FPN)** (*"Feature Pyramid Networks for Object Detection", Lin et al., 2017*)
+   - **Perché è stato progettato:** Risolvere il problema degli oggetti multi-scala fondendo le feature semanticamente forti (bassa risoluzione) con quelle semanticamente deboli ma spazialmente accurate (alta risoluzione).
+   - **Cosa fa qui:** In origine SAM riceveva solo la feature map a $1/16$ (troppo schiacciata per micro-lesioni). Ora usiamo un design stile FPN in `HardNetUNetHead` proiettando e sommando i livelli 1/16 (`d1`), 1/8 (`d2`) e 1/4 (`d3`).
+
+4. **CBAM (Spatial & Channel Attention)** (*"CBAM: Convolutional Block Attention Module", Woo et al., 2018*)
+   - **Perché è stato progettato:** Regolarizzatore per CNN classiche. L'intuizione è che non tutti i canali (tipi di feature) o tutte le zone spaziali sono ugualmente utili al momento della decisione finale. Usa una Shared MLP e conv 7x7.
+   - **Cosa fa qui:** Inserito in `models/sam_unet_decoder.py` (`FeatureFusionBlock`). Quando fondiamo le features del ViT di SAM con quelle di HardNet, non le uniamo alla cieca. Il CBAM sopprime i canali discordanti e guida l'attenzione spaziale per creare una fusione omogenea.
+
+5. **Segment Anything Model (SAM)** (*"Segment Anything", Kirillov et al., 2023*)
+   - **Perché è stato progettato:** Un modello fondazionale task-agnostic per segmentare qualsiasi oggetto fornendo dei prompt (punti, box, maschere).
+   - **Cosa fa qui:** Funge da raffinatore globale nello Stage 2. L'encoder ViT codifica l'immagine internamente, mentre il `MaskDecoder` riceve i calcoli locali della U-Net come "aiuti" per decidere i bordi finali.
+
+### Componenti "Inventate" / Ingegnerizzazione Custom
+
+1. **FeatureFusionBlock con GroupNorm Pre-Concatenazione** 
+   - **L'idea:** I ViT Embeddings hanno una distribuzione definita da un `LayerNorm` stazionario, mentre le convoluzioni HardNet escono da delle `BatchNorm2d`. Concatenarli assieme sbilancia i pesi del modulo CBAM.
+   - **Cosa fa:** Ho introdotto una `nn.GroupNorm` sulle feature HardNet proprio prima del `torch.cat()` per livellare l'energia delle due distribuzioni e stabilizzare l'apprendimento della CBAM.
+
+2. **Learnable Prompt Refiner** 
+   - **L'idea:** SAM accetta una maschera densa (mask prompt). Tradizionalmente si preleva l'output dello Stage 1 e lo si schiaccia tra 0 e 1 con un semplice `torch.sigmoid()`. Ma i logit grezzi dello stage 1 possono avere bordi sfrangiati o lievi FP.
+   - **Cosa fa:** In `models/hardnet_feat_seg_unet.py`. Sostituisce il thresholding rigido con due strati convoluzionali $3 \times 3$ appresi. Questo "mini-modulo" impara a "pulire" la predizione dello Stage 1 (es. smussando bordi spuri) prima di consegnare la maschera-prior a SAM.
+
+---
+
+## 2. Diagramma del Flusso dei Dati (Forward Pass)
+
+Comprendere come comunicano i moduli è vitale. Questo diagramma illustra un'iterazione completa al passaggio dell'immagine.
+
+```mermaid
+graph TD
+    X[Immagine Input] --> ViT((SAM Image Encoder ViT))
+    X --> Backbone((HardNet Encoder))
+    
+    %% BRANCH 1: SAM ViT
+    ViT -->|image_embeddings a 1/16| FusionBlock
+    
+    %% BRANCH 2: HardNet U-Net
+    Backbone -->|Skip Connections| AG[Attention Gates]
+    Backbone -->|x32| Dec[HardNet U-Net Decoder]
+    
+    AG --> Dec
+    
+    %% Multi-Scale Extraction
+    Dec -->|d1 - 1/16| FPN(Multi-Scale FPN Proj)
+    Dec -->|d2 - 1/8| FPN
+    Dec -->|d3 - 1/4| FPN
+    
+    Dec -->|d4 logits| LPR[Learnable Prompt Refiner]
+    LPR -->|Mask Prompt Pulita| PromptEnc((SAM Prompt Encoder))
+    
+    FPN -->|dense_features 1/16| FusionBlock
+    
+    subgraph SAM_Stage_2 [Stage 2: Modulo SAM Avanzato]
+        FusionBlock[FeatureFusionBlock + CBAM attention]
+        FusionBlock -->|fused_embeddings| MaskDec((SAM Mask Decoder))
+        PromptEnc -->|sparse / dense| MaskDec
+        MaskDec -->|Final Mask| Out2[Out2 Finale]
+    end
+    
+    LPR -.-> Out1[Out 1 per Backprop]
+```
+
+---
+
+## 3. Spiegazione Passo-Passo dell'Architettura
+
+Quando l'immagine `x` entra in `HardNetFeatSegUNet.forward()`, accade questo:
+
+### Fase 1: Esplorazione Parallela
+L'immagine viene copiata in due percorsi. 
+- Nel **primo percorso (ViT)**, l'immagine viene tradotta in patch 16x16. La rete capisce il contesto generale (es. "questo è un cervello", "ecco la materia grigia"), producendo gli `image_embeddings`.
+- Nel **secondo percorso (HardNet)**, la rete scende a livello microscopico (1/2, 1/4) salvando i dettagli. 
+
+### Fase 2: Raffinamento e Ascesa (Attention U-Net)
+Durante la ricostruzione in `HardNetUNetHead`, l'encoder comunica con il decoder. Invece di inviare tutte le texture (rumorose), l'**Attention Gate** viene attivato: chiede al decoder "Cosa stai cercando?" (Gating Signal), poi maschera l'immagine e fa passare solo i dettagli delle lesioni (Skip Connection filtrata).
+
+### Fase 3: Estrazione del Concentrato Multi-Scala
+Invece di affidare a SAM solo le feature del livello più profondo, la tecnica **FPN-style** preleva l'output di `d1` (risoluzione 1/16), `d2` (1/8) e `d3` (1/4). Tutto viene portato in asse a 1/16, omogeneizzato a 256 canali e sommato. Ora abbiamo delle `dense_features` ad altissima densità informativa dimensionate per il ViT.
+
+### Fase 4: Preparazione del Prompt (Learnable Refiner)
+L'output finale della U-Net deve suggerire a SAM *dove* guardare. Piuttosto che un "sì/no" brutale (Sigmoid), il **Learnable Prompt Refiner** agisce come un correttore di bozze: analizza l'output della UNet, corregge piccole incertezze strutturali imparando un filtro 3x3 e restituisce una morbida e precisa mask-prompt per SAM.
+
+### Fase 5: La Fusione CBAM
+Questo è il collante. Abbiamo l'embedding "macro" del ViT e le features "micro" di HardNet. Il `FeatureFusionBlock` le normalizza e le concatena. A questo punto subentra la **CBAM**:
+1. *Channel Attention*: Sopprime le mappe di feature irrilevanti e amplifica quelle utili.
+2. *Spatial Attention*: Accentra il segnale nelle coordinate esatte dove ci sono variazioni d'intensità rilevanti.
+
+### Fase 6: Risoluzione Definitiva
+Il `MaskDecoder` di SAM originale prende gli embedding ibridati col CBAM e la mask-prompt "raffinata". Sfrutta una logica Two-Way Transformer per riordinare tutto ed emette il risultato finale `out2`, portando i falsi positivi/falsi negativi al minimo concepibile dal modello.

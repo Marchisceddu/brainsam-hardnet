@@ -46,9 +46,26 @@ class HardNetFeatSegUNet(nn.Module):
     def mask_decoder(self):
         return self.sam_unet_decoder.mask_decoder
 
-    def forward(self, x):
+    def forward(self, x, stage1_only=False):
         original_size = x.shape[-1]
         
+        # 2. HardNet U-Net estrae logits e dense_features
+        mask_logits, hardnet_dense_features = self.hardnet_unet_stage(x)
+        out1 = mask_logits
+        
+        if out1.shape[-1] != original_size:
+            out1_resized = F.interpolate(
+                out1,
+                (original_size, original_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+        else:
+            out1_resized = out1
+
+        if stage1_only:
+            return out1_resized, None, mask_logits
+
         # Resize per il ViT
         if x.shape[-1] != self.image_encoder.img_size:
             x_vit = F.interpolate(
@@ -65,20 +82,6 @@ class HardNetFeatSegUNet(nn.Module):
         
         # Estrarre Positional Embeddings dall'encoder del prompt
         image_pe = self.prompt_encoder.get_dense_pe()
-        
-        # 2. HardNet U-Net estrae logits e dense_features
-        mask_logits, hardnet_dense_features = self.hardnet_unet_stage(x)
-        out1 = mask_logits
-        
-        if out1.shape[-1] != original_size:
-            out1_resized = F.interpolate(
-                out1,
-                (original_size, original_size),
-                mode="bilinear",
-                align_corners=False,
-            )
-        else:
-            out1_resized = out1
 
         out_d = out1
 
