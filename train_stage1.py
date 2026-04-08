@@ -41,11 +41,11 @@ parser.add_argument('--epochs', default=300, type=int, required=False,
                     help='number of total epochs to run')
 parser.add_argument('--start_epoch', default=30, type=int, required=False,
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('--batch_size', default=2, type=int, required=False,
+parser.add_argument('--batch_size', default=4, type=int, required=False,
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
                          'using Data Parallel or Distributed Data Parallel')
-parser.add_argument('--lr', default=0.01, type=float, required=False,
+parser.add_argument('--lr', default=0.005, type=float, required=False,
                     metavar='LR', help='initial learning rate')
 parser.add_argument('--weight_decay', default=1e-4, type=float, required=False,
                     metavar='W', help='weight decay (default: 1e-4)',)
@@ -133,6 +133,10 @@ parser.add_argument('--use_tensorboard', action='store_true',
                 help='Enable TensorBoard logging (disabled by default to avoid TensorFlow startup warnings).')
 
 # Scheduler parameters
+parser.add_argument('--warmup_epochs', type=int, default=5,
+                help='Number of warmup epochs. Set to 0 to disable.')
+parser.add_argument('--warmup_start_lr', type=float, default=1e-6,
+                help='Initial learning rate for the warmup phase.')
 parser.add_argument('--lr_scheduler', type=str, default='poly', choices=['step', 'plateau', 'both', 'poly', 'cosine'],
                 help='Which learning rate scheduler to use (step, plateau, both, poly, or cosine).')
 parser.add_argument('--plateau_patience', type=int, default=3,
@@ -501,6 +505,7 @@ def _log_wandb_validation_images(wandb_run, epoch, vis_dict, max_images):
     gts = vis_dict['mask']
     out1 = vis_dict['out1']
     out2 = vis_dict['out2']
+    img_ids = vis_dict.get('img_id', [f"sample_{i}" for i in range(imgs.shape[0])])
 
     log_items = []
     n = min(max_images, imgs.shape[0])
@@ -513,10 +518,12 @@ def _log_wandb_validation_images(wandb_run, epoch, vis_dict, max_images):
         d1 = _dice_from_masks(gt_np, p1_np)
         d2 = _dice_from_masks(gt_np, p2_np)
         panel = _build_wandb_qualitative_panel(img_np, gt_np, p1_np, p2_np)
+        
+        target_id = img_ids[i]
         log_items.append(
             wandb.Image(
                 panel,
-                caption=f"epoch={epoch} sample={i} dice_stage1={d1:.4f} dice_final={d2:.4f}",
+                caption=f"id={target_id} epoch={epoch} ds1={d1:.4f} ds2={d2:.4f}",
             )
         )
 
@@ -605,6 +612,8 @@ def main_worker(args):
     scheduler_step = None
     scheduler_plateau = None
     
+    main_epochs = args.epochs - args.warmup_epochs if args.warmup_epochs < args.epochs else args.epochs
+
     if args.lr_scheduler in ['step', 'both']:
         scheduler_step = torch.optim.lr_scheduler.StepLR(optimizer, step_size=8, gamma=0.5)
         
@@ -616,12 +625,12 @@ def main_worker(args):
     if args.lr_scheduler == 'poly':
         scheduler_step = torch.optim.lr_scheduler.LambdaLR(
             optimizer,
-            lr_lambda=lambda epoch: (1 - epoch / args.epochs) ** 0.9
+            lr_lambda=lambda epoch: (1 - epoch / max(1, main_epochs)) ** 0.9
         )
         
     if args.lr_scheduler == 'cosine':
         scheduler_step = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.epochs, eta_min=1e-6
+            optimizer, T_max=max(1, main_epochs), eta_min=1e-6
         )
 
     # optionally resume from a checkpoint
@@ -987,15 +996,16 @@ def main_worker(args):
                     max_images=max(1, args.wandb_max_images),
                 )
 
-        if scheduler_step is not None:
-            scheduler_step.step()
-        if scheduler_plateau is not None:
-            if has_valid_3d_dsc:
-                scheduler_plateau.step(val_dsc_3d_macro_stage1)
-            else:
-                # If no valid 3D DSC, we don't step the plateau scheduler
-                # for now, as it is configured in 'max' mode for DSC.
-                pass
+        if epoch >= args.warmup_epochs:
+            if scheduler_step is not None:
+                scheduler_step.step()
+            if scheduler_plateau is not None:
+                if has_valid_3d_dsc:
+                    scheduler_plateau.step(val_dsc_3d_macro_stage1)
+                else:
+                    # If no valid 3D DSC, we don't step the plateau scheduler
+                    # for now, as it is configured in 'max' mode for DSC.
+                    pass
 
         # save checkpoint (only rank 0): prioritize 3D DSC when available, else use loss
         is_best_epoch = False
@@ -1056,9 +1066,22 @@ def train(train_loader, model, optimizer, epoch, args, writer, device, criterion
 
     optimizer.zero_grad()  # zero once at the start
 
+    iters_per_epoch = len(train_loader)
+    warmup_steps = args.warmup_epochs * iters_per_epoch
+
     for step, batch in enumerate(tqdm(train_loader,
                                       total=len(train_loader),
                                       disable=not is_main_process())):
+        
+        # --- Per-step Linear Warmup ---
+        global_step = epoch * iters_per_epoch + step
+        if args.warmup_epochs > 0 and global_step < warmup_steps:
+            alpha = global_step / max(1, warmup_steps - 1)
+            warmup_lr = args.warmup_start_lr + alpha * (args.lr - args.warmup_start_lr)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = warmup_lr
+        # ------------------------------
+
         img = batch['img'].to(device)
         mask = batch['mask'].to(device, dtype=torch.long).squeeze(dim=1)
 
@@ -1175,14 +1198,45 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
                     'slice_idx': int(batch['slice_idx'][i]) if 'slice_idx' in batch else None,
                 })
 
-            if vis_dict is None and is_main_process() and args.wandb_log_images_every > 0:
-                max_n = max(1, args.wandb_max_images)
-                vis_dict = {
-                    'img': img[:max_n].detach().cpu(),
-                    'mask': mask[:max_n].detach().cpu(),
-                    'out1': img_out1[:max_n].detach().cpu(),
-                    'out2': img_out1[:max_n].detach().cpu(),
-                }
+            # Target specific images for W&B logging
+            target_ids = ["P69_T1_090", "P64_T1_088"]  # P69_T1_090 requested, P64_T1_088 chosen
+            if is_main_process() and args.wandb_log_images_every > 0:
+                if vis_dict is None:
+                    vis_dict = {'img': [], 'mask': [], 'out1': [], 'out2': [], 'img_id': []}
+                
+                for i in range(img.shape[0]):
+                    current_id = batch['img_id'][i]
+                    # Log if it's one of our targets OR if we still need images to reach wandb_max_images
+                    if current_id in target_ids or len(vis_dict['img']) < args.wandb_max_images:
+                        # Avoid duplicates if a target is found multiple times (shouldn't happen in val)
+                        if current_id not in vis_dict['img_id']:
+                            vis_dict['img'].append(img[i].detach().cpu())
+                            vis_dict['mask'].append(mask[i].detach().cpu())
+                            vis_dict['out1'].append(img_out1[i].detach().cpu())
+                            vis_dict['out2'].append(img_out1[i].detach().cpu())
+                            vis_dict['img_id'].append(current_id)
+
+    # Convert vis_dict lists to tensors if we collected anything
+    if is_main_process() and vis_dict is not None and len(vis_dict['img']) > 0:
+        # Re-order to prioritize target_ids if present
+        sorted_indices = []
+        for tid in target_ids:
+            if tid in vis_dict['img_id']:
+                sorted_indices.append(vis_dict['img_id'].index(tid))
+        for i in range(len(vis_dict['img_id'])):
+            if i not in sorted_indices:
+                sorted_indices.append(i)
+        
+        # Keep only up to wandb_max_images
+        sorted_indices = sorted_indices[:args.wandb_max_images]
+        
+        vis_dict = {
+            'img': torch.stack([vis_dict['img'][i] for i in sorted_indices]),
+            'mask': torch.stack([vis_dict['mask'][i] for i in sorted_indices]),
+            'out1': torch.stack([vis_dict['out1'][i] for i in sorted_indices]),
+            'out2': torch.stack([vis_dict['out2'][i] for i in sorted_indices]),
+            'img_id': [vis_dict['img_id'][i] for i in sorted_indices]
+        }
 
     # ── Synchronize validation metrics across all GPUs ──
     if args.distributed:
@@ -1204,10 +1258,42 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
     val_dsc_3d_macro_stage2 = float('nan')
     val_dsc_3d_micro_stage2 = float('nan')
     num_volumes_3d = 0
+    val_dsc_2d_ignore_neg = float('nan')
+    val_dsc_2d_keep_neg = float('nan')
     
     if val_loader_data:
         volume_dict, num_volumes_3d = _rebuild_volumes_for_3d_validation(val_loader_data)
         
+        if is_main_process():
+            # ── 2D Slice-wise metrics computation ──
+            slice_metric_ignore = DiceMetric(include_background=False, reduction="mean", ignore_empty=True)
+            slice_metric_keep = DiceMetric(include_background=False, reduction="mean", ignore_empty=False)
+            
+            for item in val_loader_data:
+                p1 = item['pred1_binary'].astype(np.float32)
+                gt = item['gt_binary'].astype(np.float32)
+                
+                p1_oh = np.stack([1 - p1, p1], axis=0)
+                gt_oh = np.stack([1 - gt, gt], axis=0)
+                
+                p1_t = torch.from_numpy(p1_oh).unsqueeze(0)
+                gt_t = torch.from_numpy(gt_oh).unsqueeze(0)
+                
+                slice_metric_ignore(y_pred=p1_t, y=gt_t)
+                slice_metric_keep(y_pred=p1_t, y=gt_t)
+            
+            try:
+                val_dsc_2d_ignore_neg_t = slice_metric_ignore.aggregate()
+                val_dsc_2d_ignore_neg = float(val_dsc_2d_ignore_neg_t.item()) if not torch.isnan(val_dsc_2d_ignore_neg_t).all() else float('nan')
+            except Exception:
+                pass
+                
+            try:
+                val_dsc_2d_keep_neg_t = slice_metric_keep.aggregate()
+                val_dsc_2d_keep_neg = float(val_dsc_2d_keep_neg_t.item()) if not torch.isnan(val_dsc_2d_keep_neg_t).all() else float('nan')
+            except Exception:
+                pass
+
         if num_volumes_3d > 0 and is_main_process():
             dice_metric_s1 = DiceMetric(include_background=False, reduction="mean")
             dice_metric_s2 = DiceMetric(include_background=False, reduction="mean")
@@ -1270,6 +1356,8 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
     
     if is_main_process():
         print(f'epoch[{epoch}]: val_loss     = {val_loss:.6f}')
+        print(f'epoch[{epoch}]: val_dsc_2d_stage1 (ignore neg) = {val_dsc_2d_ignore_neg:.4f}')
+        print(f'epoch[{epoch}]: val_dsc_2d_stage1 (keep neg)   = {val_dsc_2d_keep_neg:.4f}')
         if num_volumes_3d > 0:
             print(f'epoch[{epoch}]: val_dsc_3d_macro_stage1 (per-volume) = {val_dsc_3d_macro_stage1:.4f} ({num_volumes_3d} volumes)')
             print(f'epoch[{epoch}]: val_dsc_3d_micro_stage1 (global) = {val_dsc_3d_micro_stage1:.4f}')
@@ -1278,6 +1366,8 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
 
         if writer is not None:
             writer.add_scalar("val_loss", val_loss, global_step=epoch)
+            writer.add_scalar("val_dsc_2d_ignore_neg_stage1", val_dsc_2d_ignore_neg, global_step=epoch)
+            writer.add_scalar("val_dsc_2d_keep_neg_stage1", val_dsc_2d_keep_neg, global_step=epoch)
             if num_volumes_3d > 0:
                 writer.add_scalar("val_dsc_3d_macro_stage1", val_dsc_3d_macro_stage1, global_step=epoch)
                 writer.add_scalar("val_dsc_3d_micro_stage1", val_dsc_3d_micro_stage1, global_step=epoch)
@@ -1285,6 +1375,8 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
                 writer.add_scalar("val_dsc_3d_micro_stage2", val_dsc_3d_micro_stage2, global_step=epoch)
 
     return val_loss, {
+        "val/dsc_2d_ignore_neg_stage1": val_dsc_2d_ignore_neg,
+        "val/dsc_2d_keep_neg_stage1": val_dsc_2d_keep_neg,
         "val/dsc_3d_macro_stage1": val_dsc_3d_macro_stage1,
         "val/dsc_3d_micro_stage1": val_dsc_3d_micro_stage1,
         "val/dsc_3d_macro_stage2": val_dsc_3d_macro_stage2,
