@@ -787,23 +787,6 @@ def main_worker(args):
         # === GEOMETRICHE ===
         albu.HorizontalFlip(p=0.5),
         albu.VerticalFlip(p=0.5),
-        albu.RandomRotate90(p=0.5),
-        albu.Affine(
-            translate_percent=0.1, scale=(0.85, 1.15), rotate=(-15, 15),
-            border_mode=cv2.BORDER_CONSTANT, fill=0, fill_mask=0, p=0.5
-        ),
-        albu.ElasticTransform(
-            alpha=120, sigma=120 * 0.05,
-            border_mode=cv2.BORDER_CONSTANT, fill=0, fill_mask=0,
-            p=0.2
-        ),
-        # === INTENSITÀ ===
-        albu.RandomBrightnessContrast(
-            brightness_limit=0.15, contrast_limit=0.15, p=0.3
-        ),
-        albu.RandomGamma(gamma_limit=(80, 120), p=0.3),
-        albu.GaussNoise(std_range=(0.02, 0.15), p=0.15),
-        albu.GaussianBlur(blur_limit=(3, 5), p=0.1),
         # === NORMALIZZAZIONE ===
         albu.Normalize(
             mean=norm_mean,
