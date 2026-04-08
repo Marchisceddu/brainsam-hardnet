@@ -1166,6 +1166,15 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
     num_batches = 0
     vis_dict = None
     val_loader_data = []  # Collect batch data for 3D reconstruction
+    
+    # Initialize MONAI metrics for 2D real-time DSC
+    val_metric_ignore = DiceMetric(include_background=False, reduction="none", ignore_empty=True)
+    val_metric_keep = DiceMetric(include_background=False, reduction="none", ignore_empty=False)
+
+    val_dsc_ignore_sum = 0.0
+    val_dsc_ignore_count = 0
+    val_dsc_keep_sum = 0.0
+    val_dsc_keep_count = 0
 
     with torch.no_grad():  # ← no gradient computation during validation
         for batch in tqdm(val_loader, total=len(val_loader),
@@ -1184,6 +1193,23 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
 
             val_loss_sum += loss.item()
             num_batches += 1
+
+            # ── 2D Slice-wise metrics computation ──
+            preds = img_out1_for_loss.argmax(dim=1).unsqueeze(1).float() # [B, 1, H, W]
+            preds_oh = torch.cat([1.0 - preds, preds], dim=1) # [B, 2, H, W]
+            mask_monai_tmp = mask.unsqueeze(1).float()
+            gt_oh = torch.cat([1.0 - mask_monai_tmp, mask_monai_tmp], dim=1)
+            
+            ignore_res = val_metric_ignore(y_pred=preds_oh, y=gt_oh).to(device) # [B, 1]
+            keep_res = val_metric_keep(y_pred=preds_oh, y=gt_oh).to(device) # [B, 1]
+            
+            valid_ignore = ~torch.isnan(ignore_res)
+            val_dsc_ignore_sum += ignore_res[valid_ignore].sum().item()
+            val_dsc_ignore_count += valid_ignore.sum().item()
+            
+            valid_keep = ~torch.isnan(keep_res)
+            val_dsc_keep_sum += keep_res[valid_keep].sum().item()
+            val_dsc_keep_count += valid_keep.sum().item()
 
             # Collect data for 3D validation (per-volume DSC)
             for i in range(img.shape[0]):
@@ -1242,6 +1268,11 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
     if args.distributed:
         val_loss_sum = reduce_tensor(val_loss_sum, device)
         num_batches = reduce_tensor(num_batches, device)
+        
+        val_dsc_ignore_sum = reduce_tensor(val_dsc_ignore_sum, device)
+        val_dsc_ignore_count = reduce_tensor(val_dsc_ignore_count, device)
+        val_dsc_keep_sum = reduce_tensor(val_dsc_keep_sum, device)
+        val_dsc_keep_count = reduce_tensor(val_dsc_keep_count, device)
 
         # Gather slice predictions from all GPUs for 3D metric calculation
         gathered_data = [None for _ in range(dist.get_world_size())]
@@ -1251,6 +1282,9 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
     # Average over total batches across all GPUs
     num_batches = max(num_batches, 1)
     val_loss = val_loss_sum / num_batches
+    
+    val_dsc_2d_ignore_neg = val_dsc_ignore_sum / max(val_dsc_ignore_count, 1) if val_dsc_ignore_count > 0 else float('nan')
+    val_dsc_2d_keep_neg = val_dsc_keep_sum / max(val_dsc_keep_count, 1) if val_dsc_keep_count > 0 else float('nan')
 
     # ── Compute 3D volume-wise DSC (if metadata available) ──
     val_dsc_3d_macro_stage1 = float('nan')
@@ -1258,42 +1292,10 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
     val_dsc_3d_macro_stage2 = float('nan')
     val_dsc_3d_micro_stage2 = float('nan')
     num_volumes_3d = 0
-    val_dsc_2d_ignore_neg = float('nan')
-    val_dsc_2d_keep_neg = float('nan')
     
     if val_loader_data:
         volume_dict, num_volumes_3d = _rebuild_volumes_for_3d_validation(val_loader_data)
         
-        if is_main_process():
-            # ── 2D Slice-wise metrics computation ──
-            slice_metric_ignore = DiceMetric(include_background=False, reduction="mean", ignore_empty=True)
-            slice_metric_keep = DiceMetric(include_background=False, reduction="mean", ignore_empty=False)
-            
-            for item in val_loader_data:
-                p1 = item['pred1_binary'].astype(np.float32)
-                gt = item['gt_binary'].astype(np.float32)
-                
-                p1_oh = np.stack([1 - p1, p1], axis=0)
-                gt_oh = np.stack([1 - gt, gt], axis=0)
-                
-                p1_t = torch.from_numpy(p1_oh).unsqueeze(0)
-                gt_t = torch.from_numpy(gt_oh).unsqueeze(0)
-                
-                slice_metric_ignore(y_pred=p1_t, y=gt_t)
-                slice_metric_keep(y_pred=p1_t, y=gt_t)
-            
-            try:
-                val_dsc_2d_ignore_neg_t = slice_metric_ignore.aggregate()
-                val_dsc_2d_ignore_neg = float(val_dsc_2d_ignore_neg_t.item()) if not torch.isnan(val_dsc_2d_ignore_neg_t).all() else float('nan')
-            except Exception:
-                pass
-                
-            try:
-                val_dsc_2d_keep_neg_t = slice_metric_keep.aggregate()
-                val_dsc_2d_keep_neg = float(val_dsc_2d_keep_neg_t.item()) if not torch.isnan(val_dsc_2d_keep_neg_t).all() else float('nan')
-            except Exception:
-                pass
-
         if num_volumes_3d > 0 and is_main_process():
             dice_metric_s1 = DiceMetric(include_background=False, reduction="mean")
             dice_metric_s2 = DiceMetric(include_background=False, reduction="mean")
