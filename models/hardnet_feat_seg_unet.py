@@ -42,6 +42,11 @@ class HardNetFeatSegUNet(nn.Module):
         self.sam_unet_decoder = sam_unet_decoder
         self.prompt_refiner = LearnablePromptRefiner(in_channels=1)
 
+        # Multi-scale FPN Dense Features projection
+        self.proj_d1 = nn.Conv2d(512, 256, kernel_size=1)
+        self.proj_d2 = nn.Conv2d(256, 256, kernel_size=1)
+        self.proj_d3 = nn.Conv2d(128, 256, kernel_size=1)
+
     @property
     def mask_decoder(self):
         return self.sam_unet_decoder.mask_decoder
@@ -49,9 +54,16 @@ class HardNetFeatSegUNet(nn.Module):
     def forward(self, x, stage1_only=False):
         original_size = x.shape[-1]
         
-        # 2. HardNet U-Net estrae logits e dense_features
-        mask_logits, hardnet_dense_features = self.hardnet_unet_stage(x)
+        # 2. HardNet U-Net estrae logits e feature maps (d1, d2, d3)
+        mask_logits, (d1, d2, d3) = self.hardnet_unet_stage(x)
         out1 = mask_logits
+        
+        # Feature Pyramid fusion for dense features (allineate a d1, cioè 1/16)
+        dense_d1 = self.proj_d1(d1)
+        dense_d2 = F.interpolate(self.proj_d2(d2), size=dense_d1.shape[-2:], mode="bilinear", align_corners=False)
+        dense_d3 = F.interpolate(self.proj_d3(d3), size=dense_d1.shape[-2:], mode="bilinear", align_corners=False)
+        
+        hardnet_dense_features = dense_d1 + dense_d2 + dense_d3
         
         if out1.shape[-1] != original_size:
             out1_resized = F.interpolate(

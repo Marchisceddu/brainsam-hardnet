@@ -13,6 +13,7 @@ from tqdm import tqdm
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.optim
@@ -27,7 +28,6 @@ from monai.losses import DiceLoss, DiceCELoss
 from monai.metrics import DiceMetric
 from models import sam_feat_seg_model_registry, sam_unet_model_registry, sam_unet_cnn_model_registry
 from train_dataset import Dataset, parse_volume_info
-from lora_layers import inject_lora_sam
 
 try:
     import wandb
@@ -57,16 +57,8 @@ parser.add_argument('--seed', default=7, type=int, required=False,
                     help='seed for initializing training. ')
 parser.add_argument('--gpu', default=0, type=int, required=False,
                     help='GPU id to use (single-GPU mode only).')
-parser.add_argument("--iter_2stage", type=int, default=1, required=False,
-                    help='Number of second-stage iterations (fixed to 1 for training)')
 parser.add_argument("--num_classes", type=int, default=2, required=False,)
 parser.add_argument("--save_dir", type=str, default='', required=False,)
-parser.add_argument("--load_saved_model", action='store_true',
-                    help='whether freeze encoder of the segmenter')
-parser.add_argument('--model_type', type=str, default="vit_b_hardnet_unet", required=False,
-                help='Model key: vit_b_hardnet, vit_l_hardnet, vit_h_hardnet, '
-                    'vit_b_hardnet_unet, vit_l_hardnet_unet, vit_h_hardnet_unet, '
-                    'vit_b_hardnet_unet_cnn, vit_l_hardnet_unet_cnn, vit_h_hardnet_unet_cnn.')
 parser.add_argument('--input_channels', type=int, default=1, choices=[1, 3],
                     help='Input channels: 1 for grayscale MRI (recommended), 3 for RGB.')
 parser.add_argument('--format_img', type=str, default='.tif', required=False, help='')
@@ -77,7 +69,6 @@ parser.add_argument('--img_path', type=str, required=False, default=r'',
                     help='(Legacy) Single image directory for auto 80/20 split')
 parser.add_argument('--label_path', type=str, required=False, default=r'',
                     help='(Legacy) Single label directory for auto 80/20 split')
-parser.add_argument('--model_checkpoint', type=str, required=False, default=r'')
 
 # Separate train/val directories (recommended — no data leakage)
 parser.add_argument('--train_img_path', type=str, default='',
@@ -150,22 +141,6 @@ parser.add_argument('--optimizer', type=str, default='sgd', choices=['adam', 'ad
 parser.add_argument('--clip_grad', type=float, default=0.0,
                 help='Max norm for gradient clipping. Set to 0.0 to disable.')
 
-# LoRA only for the SAM ViT image encoder.
-parser.add_argument('--lora_vit', action='store_true',
-                help='Enable LoRA adapters in the SAM ViT image encoder.')
-parser.add_argument('--lora_vit_targets', type=str, default='q,v,mlp1,mlp2',
-                help='Comma-separated LoRA targets for the ViT encoder. '
-                    'Supported values: q, k, v, out, mlp1, mlp2. '
-                    'Use q,v,mlp1,mlp2 by default.')
-parser.add_argument('--lora_r', type=int, default=8,
-                help='LoRA rank for the ViT encoder.')
-parser.add_argument('--lora_alpha', type=float, default=16.0,
-                help='LoRA alpha scaling for the ViT encoder.')
-parser.add_argument('--lora_dropout', type=float, default=0.0,
-                help='LoRA dropout for the ViT encoder.')
-parser.add_argument('--lora_bias', action='store_true',
-                help='Use bias in LoRA adapter projections.')
-
 
 # ──────────────────────────────────────────────
 #  Metrics
@@ -227,69 +202,6 @@ def _ensure_multiclass_logits(logits, num_classes):
         return torch.cat([-logits, logits], dim=1)
     return logits
 
-
-def _parse_vit_lora_targets(targets: str) -> Dict[str, bool]:
-    """Translate CLI target aliases into the keys expected by lora_layers.py."""
-    alias_to_key = {
-        'q': 'q_proj',
-        'q_proj': 'q_proj',
-        'k': 'k_proj',
-        'k_proj': 'k_proj',
-        'v': 'v_proj',
-        'v_proj': 'v_proj',
-        'out': 'out_proj',
-        'proj': 'out_proj',
-        'out_proj': 'out_proj',
-        'mlp1': 'mlp_lin1',
-        'mlp_lin1': 'mlp_lin1',
-        'mlp2': 'mlp_lin2',
-        'mlp_lin2': 'mlp_lin2',
-        'all': 'all',
-    }
-    supported_keys = ['q_proj', 'k_proj', 'v_proj', 'out_proj', 'mlp_lin1', 'mlp_lin2']
-    selected = set()
-
-    for token in (part.strip().lower() for part in targets.split(',')):
-        if not token:
-            continue
-        if token not in alias_to_key:
-            raise ValueError(
-                f"Unknown LoRA target '{token}'. Supported values: q, k, v, out, mlp1, mlp2, all."
-            )
-        mapped = alias_to_key[token]
-        if mapped == 'all':
-            selected.update(supported_keys)
-        else:
-            selected.add(mapped)
-
-    if not selected:
-        raise ValueError("At least one LoRA target must be selected.")
-
-    return {key: key in selected for key in supported_keys}
-
-
-def _build_vit_lora_cfg(args):
-    """Build the minimal config object expected by inject_lora_sam()."""
-    encoder_targets = _parse_vit_lora_targets(args.lora_vit_targets)
-
-    return SimpleNamespace(
-        encoder=SimpleNamespace(
-            enabled=args.lora_vit,
-            lora_r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            lora_bias=args.lora_bias,
-            lora_targets=encoder_targets,
-        ),
-        decoder=SimpleNamespace(
-            enabled=False,
-            lora_r=0,
-            lora_alpha=0.0,
-            lora_dropout=0.0,
-            lora_bias=False,
-            lora_targets={},
-        ),
-    )
 
 
 # ──────────────────────────────────────────────
@@ -433,28 +345,24 @@ def _draw_contours(base_img, gt_mask, pred_mask):
     return canvas
 
 
-def _build_wandb_qualitative_panel(img, gt, pred1, pred2):
-    """Create a 2x2 panel: raw image, GT+stage1, GT+stage2, error map."""
+def _build_wandb_qualitative_panel(img, gt, pred1):
+    """Create a panel: raw image, GT+stage1, error map."""
     h, w = img.shape[:2]
 
     raw = img.copy()
     stage1 = _draw_contours(img, gt, pred1)
-    stage2 = _draw_contours(img, gt, pred2)
 
-    fp = np.logical_and(pred2 == 1, gt == 0)
-    fn = np.logical_and(pred2 == 0, gt == 1)
+    fp = np.logical_and(pred1 == 1, gt == 0)
+    fn = np.logical_and(pred1 == 0, gt == 1)
     err = img.copy()
     err[fp] = [255, 255, 0]   # False Positive: Yellow (Red+Green) in RGB
     err[fn] = [255, 0, 255]   # False Negative: Magenta (Red+Blue) in RGB
 
     cv2.putText(raw, 'Image', (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     cv2.putText(stage1, 'Stage1: GT(red) Pred(cyan)', (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    cv2.putText(stage2, 'Final: GT(red) Pred(cyan)', (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     cv2.putText(err, 'Error map: FP(yellow) FN(magenta)', (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
-    top = np.concatenate([raw, stage1], axis=1)
-    bottom = np.concatenate([stage2, err], axis=1)
-    panel = np.concatenate([top, bottom], axis=0)
+    panel = np.concatenate([raw, stage1, err], axis=1)
     return panel
 
 
@@ -488,10 +396,9 @@ def _rebuild_volumes_for_3d_validation(
             
         key = (patient, timepoint)
         if key not in volume_dict:
-            volume_dict[key] = {'pred1': {}, 'pred2': {}, 'gt': {}}
+            volume_dict[key] = {'pred1': {}, 'gt': {}}
         
         volume_dict[key]['pred1'][slice_idx] = batch_item['pred1_binary']
-        volume_dict[key]['pred2'][slice_idx] = batch_item['pred2_binary']
         volume_dict[key]['gt'][slice_idx] = batch_item['gt_binary']
     
     return volume_dict, len(volume_dict)
@@ -504,7 +411,6 @@ def _log_wandb_validation_images(wandb_run, epoch, vis_dict, max_images):
     imgs = vis_dict['img']
     gts = vis_dict['mask']
     out1 = vis_dict['out1']
-    out2 = vis_dict['out2']
     img_ids = vis_dict.get('img_id', [f"sample_{i}" for i in range(imgs.shape[0])])
 
     log_items = []
@@ -513,17 +419,15 @@ def _log_wandb_validation_images(wandb_run, epoch, vis_dict, max_images):
         img_np = _tensor_to_vis_image(imgs[i])
         gt_np = (gts[i].detach().cpu().numpy() > 0).astype(np.uint8)
         p1_np = _logits_to_fg_mask(out1[i])
-        p2_np = _logits_to_fg_mask(out2[i])
 
         d1 = _dice_from_masks(gt_np, p1_np)
-        d2 = _dice_from_masks(gt_np, p2_np)
-        panel = _build_wandb_qualitative_panel(img_np, gt_np, p1_np, p2_np)
+        panel = _build_wandb_qualitative_panel(img_np, gt_np, p1_np)
         
         target_id = img_ids[i]
         log_items.append(
             wandb.Image(
                 panel,
-                caption=f"id={target_id} epoch={epoch} ds1={d1:.4f} ds2={d2:.4f}",
+                caption=f"id={target_id} epoch={epoch} dsc={d1:.4f}",
             )
         )
 
@@ -545,39 +449,24 @@ def main_worker(args):
         device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
         print(f"Use GPU: {args.gpu} for training")
 
-    # Combine both registries for selection
-    combined_registry = {
-        **sam_feat_seg_model_registry,
-        **sam_unet_model_registry,
-        **sam_unet_cnn_model_registry,
-    }
-    
-    if args.model_type not in combined_registry:
-        raise ValueError(f"Model type '{args.model_type}' not found in any registry. "
-                         f"Available: {list(combined_registry.keys())}")
-                         
-    model = combined_registry[args.model_type](
-        num_classes=args.num_classes,
-        checkpoint=args.model_checkpoint,
-        img_size=args.img_size,
-        iter_2stage=args.iter_2stage,
-        input_channels=args.input_channels,
+    from models.hardnet_unet_head import HardNetUNetHead
+
+    if is_main_process():
+        print(f"Stage 1: Using standalone HardNetUNetHead to optimize memory.")
+        
+    model = HardNetUNetHead(
+        arch=85,
+        in_channels=args.input_channels,
+        backbone_input_size=args.img_size,
+        prompt_size=256,
+        out_channels=1 if args.num_classes == 2 else args.num_classes,
+        freeze_backbone=False,
     )
     model.to(device)
 
-    if args.lora_vit:
-        lora_cfg = _build_vit_lora_cfg(args)
-        model = inject_lora_sam(model, lora_cfg)
-        if is_main_process():
-            active_targets = [name for name, enabled in lora_cfg.encoder.lora_targets.items() if enabled]
-            print(f"LoRA enabled for ViT encoder with targets: {', '.join(active_targets)}")
-    else:
-        # For stage 1, freeze everything EXCEPT hardnet_unet_stage
-        for name, param in model.named_parameters():
-            if not name.startswith("hardnet_unet_stage"):
-                param.requires_grad = False
-        if is_main_process():
-            print("Stage 1 Training: Frozen all components except hardnet_unet_stage")
+    # All parameters in HardNetUNetHead are trainable in stage 1.
+    for param in model.parameters():
+        param.requires_grad = True
 
     if is_main_process():
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -939,7 +828,7 @@ def main_worker(args):
                             wandb_run=wandb_run)
 
         # Extract 3D DSC if available
-        val_dsc_3d_macro_stage1 = val_metrics.get("val/dsc_3d_macro_stage2", float('nan'))
+        val_dsc_3d_macro_stage1 = val_metrics.get("val/dsc_3d_macro_stage1", float('nan'))
         
         # Determine if we have valid 3D DSC for checkpoint selection
         has_valid_3d_dsc = not (np.isnan(val_dsc_3d_macro_stage1) or np.isinf(val_dsc_3d_macro_stage1))
@@ -1041,9 +930,7 @@ def train(train_loader, model, optimizer, epoch, args, writer, device, criterion
     model.train()
     train_loss_sum = 0.0
     iou_stage1_sum = 0.0
-    iou_stage2_sum = 0.0
     dsc_stage1_sum = 0.0
-    dsc_stage2_sum = 0.0
     num_batches = 0
     use_ce = isinstance(criterion, nn.CrossEntropyLoss)
 
@@ -1079,7 +966,19 @@ def train(train_loader, model, optimizer, epoch, args, writer, device, criterion
               contextlib.nullcontext()
 
         with ctx:
-            img_out1, _, _ = model(img, stage1_only=True)
+            mask_logits, _ = model(img)
+            
+            original_size = img.shape[-1]
+            if mask_logits.shape[-1] != original_size:
+                img_out1 = F.interpolate(
+                    mask_logits,
+                    size=(original_size, original_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            else:
+                img_out1 = mask_logits
+
             img_out1_for_loss = _ensure_multiclass_logits(img_out1, args.num_classes)
 
             if use_ce:
@@ -1165,7 +1064,19 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
             img = batch['img'].to(device)
             mask = batch['mask'].to(device, dtype=torch.long).squeeze(dim=1)
 
-            img_out1, _, _ = model(img, stage1_only=True)
+            mask_logits, _ = model(img)
+            
+            original_size = img.shape[-1]
+            if mask_logits.shape[-1] != original_size:
+                img_out1 = F.interpolate(
+                    mask_logits,
+                    size=(original_size, original_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            else:
+                img_out1 = mask_logits
+
             img_out1_for_loss = _ensure_multiclass_logits(img_out1, args.num_classes)
 
             if use_ce:
@@ -1200,7 +1111,6 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
                 gt_binary = mask[i].detach().cpu().numpy().astype(np.uint8)
                 val_loader_data.append({
                     'pred1_binary': pred1_binary,
-                    'pred2_binary': pred1_binary,  # Fallback per stage1
                     'gt_binary': gt_binary,
                     'patient': batch['patient'][i] if 'patient' in batch else None,
                     'timepoint': batch['timepoint'][i] if 'timepoint' in batch else None,
@@ -1211,7 +1121,7 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
             target_ids = ["P69_T1_090", "P64_T1_088"]  # P69_T1_090 requested, P64_T1_088 chosen
             if is_main_process() and args.wandb_log_images_every > 0:
                 if vis_dict is None:
-                    vis_dict = {'img': [], 'mask': [], 'out1': [], 'out2': [], 'img_id': []}
+                    vis_dict = {'img': [], 'mask': [], 'out1': [], 'img_id': []}
                 
                 for i in range(img.shape[0]):
                     current_id = batch['img_id'][i]
@@ -1222,7 +1132,6 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
                             vis_dict['img'].append(img[i].detach().cpu())
                             vis_dict['mask'].append(mask[i].detach().cpu())
                             vis_dict['out1'].append(img_out1[i].detach().cpu())
-                            vis_dict['out2'].append(img_out1[i].detach().cpu())
                             vis_dict['img_id'].append(current_id)
 
     # Convert vis_dict lists to tensors if we collected anything
@@ -1243,7 +1152,6 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
             'img': torch.stack([vis_dict['img'][i] for i in sorted_indices]),
             'mask': torch.stack([vis_dict['mask'][i] for i in sorted_indices]),
             'out1': torch.stack([vis_dict['out1'][i] for i in sorted_indices]),
-            'out2': torch.stack([vis_dict['out2'][i] for i in sorted_indices]),
             'img_id': [vis_dict['img_id'][i] for i in sorted_indices]
         }
 
@@ -1272,8 +1180,6 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
     # ── Compute 3D volume-wise DSC (if metadata available) ──
     val_dsc_3d_macro_stage1 = float('nan')
     val_dsc_3d_micro_stage1 = float('nan')
-    val_dsc_3d_macro_stage2 = float('nan')
-    val_dsc_3d_micro_stage2 = float('nan')
     num_volumes_3d = 0
     
     if val_loader_data:
@@ -1281,63 +1187,44 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
         
         if num_volumes_3d > 0 and is_main_process():
             dice_metric_s1 = DiceMetric(include_background=False, reduction="mean")
-            dice_metric_s2 = DiceMetric(include_background=False, reduction="mean")
             dsc_3d_values_s1 = []
-            dsc_3d_values_s2 = []
             global_tp_s1, global_fp_s1, global_fn_s1 = 0, 0, 0
-            global_tp_s2, global_fp_s2, global_fn_s2 = 0, 0, 0
             
             # Natural sort by patient then timepoint
             sorted_keys = sorted(volume_dict.keys(), key=lambda k: (_natural_key(k[0]), _natural_key(k[1])))
             
             for patient, timepoint in sorted_keys:
                 pred1_map = volume_dict[(patient, timepoint)]['pred1']
-                pred2_map = volume_dict[(patient, timepoint)]['pred2']
                 gt_map = volume_dict[(patient, timepoint)]['gt']
                 
                 all_indices = sorted(pred1_map.keys())
                 pred1_stack = np.stack([pred1_map[s] for s in all_indices], axis=-1).astype(np.float32)
-                pred2_stack = np.stack([pred2_map[s] for s in all_indices], axis=-1).astype(np.float32)
                 gt_stack = np.stack([gt_map[s] for s in all_indices], axis=-1).astype(np.float32)
                 
                 # Convert to MONAI format: [B, C, H, W, D] with C=1
                 pred1_oh = np.stack([1 - pred1_stack, pred1_stack], axis=0)
-                pred2_oh = np.stack([1 - pred2_stack, pred2_stack], axis=0)
                 gt_oh = np.stack([1 - gt_stack, gt_stack], axis=0)
                 
                 pred1_t = torch.from_numpy(pred1_oh).unsqueeze(0)
-                pred2_t = torch.from_numpy(pred2_oh).unsqueeze(0)
                 gt_t = torch.from_numpy(gt_oh).unsqueeze(0)
                 
                 dice_metric_s1.reset()
                 dice_val_s1 = float(dice_metric_s1(y_pred=pred1_t, y=gt_t).squeeze().item())
                 dsc_3d_values_s1.append(dice_val_s1)
-
-                dice_metric_s2.reset()
-                dice_val_s2 = float(dice_metric_s2(y_pred=pred2_t, y=gt_t).squeeze().item())
-                dsc_3d_values_s2.append(dice_val_s2)
                 
                 # Accumulate for micro DSC
                 pred1_fg = (pred1_stack > 0.5).astype(bool)
-                pred2_fg = (pred2_stack > 0.5).astype(bool)
                 gt_fg = gt_stack.astype(bool)
                 
                 global_tp_s1 += int(np.logical_and(pred1_fg, gt_fg).sum())
                 global_fp_s1 += int(np.logical_and(pred1_fg, np.logical_not(gt_fg)).sum())
                 global_fn_s1 += int(np.logical_and(np.logical_not(pred1_fg), gt_fg).sum())
-                
-                global_tp_s2 += int(np.logical_and(pred2_fg, gt_fg).sum())
-                global_fp_s2 += int(np.logical_and(pred2_fg, np.logical_not(gt_fg)).sum())
-                global_fn_s2 += int(np.logical_and(np.logical_not(pred2_fg), gt_fg).sum())
             
             val_dsc_3d_macro_stage1 = float(np.nanmean(dsc_3d_values_s1)) if dsc_3d_values_s1 else float('nan')
-            val_dsc_3d_macro_stage2 = float(np.nanmean(dsc_3d_values_s2)) if dsc_3d_values_s2 else float('nan')
             
             # Micro DSC from global TP/FP/FN
             if (global_tp_s1 + global_fp_s1 + global_fn_s1) > 0:
                 val_dsc_3d_micro_stage1 = (2.0 * global_tp_s1) / (2.0 * global_tp_s1 + global_fp_s1 + global_fn_s1)
-            if (global_tp_s2 + global_fp_s2 + global_fn_s2) > 0:
-                val_dsc_3d_micro_stage2 = (2.0 * global_tp_s2) / (2.0 * global_tp_s2 + global_fp_s2 + global_fn_s2)
     
     if is_main_process():
         print(f'epoch[{epoch}]: val_loss     = {val_loss:.6f}')
@@ -1346,8 +1233,6 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
         if num_volumes_3d > 0:
             print(f'epoch[{epoch}]: val_dsc_3d_macro_stage1 (per-volume) = {val_dsc_3d_macro_stage1:.4f} ({num_volumes_3d} volumes)')
             print(f'epoch[{epoch}]: val_dsc_3d_micro_stage1 (global) = {val_dsc_3d_micro_stage1:.4f}')
-            print(f'epoch[{epoch}]: val_dsc_3d_macro_stage2 (per-volume) = {val_dsc_3d_macro_stage2:.4f} ({num_volumes_3d} volumes)')
-            print(f'epoch[{epoch}]: val_dsc_3d_micro_stage2 (global) = {val_dsc_3d_micro_stage2:.4f}')
 
         if writer is not None:
             writer.add_scalar("val_loss", val_loss, global_step=epoch)
@@ -1356,16 +1241,12 @@ def validate(val_loader, model, epoch, args, writer, device, criterion, wandb_ru
             if num_volumes_3d > 0:
                 writer.add_scalar("val_dsc_3d_macro_stage1", val_dsc_3d_macro_stage1, global_step=epoch)
                 writer.add_scalar("val_dsc_3d_micro_stage1", val_dsc_3d_micro_stage1, global_step=epoch)
-                writer.add_scalar("val_dsc_3d_macro_stage2", val_dsc_3d_macro_stage2, global_step=epoch)
-                writer.add_scalar("val_dsc_3d_micro_stage2", val_dsc_3d_micro_stage2, global_step=epoch)
 
     return val_loss, {
         "val/dsc_2d_ignore_neg_stage1": val_dsc_2d_ignore_neg,
         "val/dsc_2d_keep_neg_stage1": val_dsc_2d_keep_neg,
         "val/dsc_3d_macro_stage1": val_dsc_3d_macro_stage1,
         "val/dsc_3d_micro_stage1": val_dsc_3d_micro_stage1,
-        "val/dsc_3d_macro_stage2": val_dsc_3d_macro_stage2,
-        "val/dsc_3d_micro_stage2": val_dsc_3d_micro_stage2,
     }, vis_dict
 
 
