@@ -285,7 +285,7 @@ class DHAModule(nn.Module):
 
 
 class DecoderBlock(nn.Module):
-    def __init__(self, in_channels, skip_channels, out_channels):
+    def __init__(self, in_channels, skip_channels, out_channels, dropout_rate=0.1):
         super().__init__()
         if skip_channels > 0:
             self.dha = DHAModule(in_channels=skip_channels)
@@ -297,6 +297,8 @@ class DecoderBlock(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm2d(out_channels)
+        # Dropout2d droppa interi canali: più efficace di Dropout scalare per CNN 2D
+        self.dropout = nn.Dropout2d(p=dropout_rate)
 
     def forward(self, x, skip=None):
         x_up = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
@@ -312,6 +314,7 @@ class DecoderBlock(nn.Module):
         x_out = self.conv1(x_up)
         x_out = self.bn1(x_out)
         x_out = self.relu(x_out)
+        x_out = self.dropout(x_out)
         x_out = self.conv2(x_out)
         x_out = self.bn2(x_out)
         x_out = self.relu(x_out)
@@ -328,6 +331,8 @@ class HardNetUNetHead(nn.Module):
         prompt_size=256,
         out_channels=1,
         freeze_backbone=False,
+        decoder_dropout=0.1,   # dropout nei DecoderBlock
+        head_dropout=0.3,      # dropout prima del layer di segmentazione finale
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -364,18 +369,21 @@ class HardNetUNetHead(nn.Module):
             
         ch_x2, ch_x4, ch_x8, ch_x16, ch_x32 = self.backbone.full_features
 
-        # Bottleneck: ASPP
+        # Bottleneck: ASPP + dropout sul collo di bottiglia semantico
         self.aspp = ASPP(in_channels=ch_x32, branch_channels=256)
+        self.aspp_dropout = nn.Dropout2d(p=decoder_dropout)
 
         # Decoder Stages
-        self.dec1 = DecoderBlock(in_channels=ch_x32, skip_channels=ch_x16, out_channels=512)
+        self.dec1 = DecoderBlock(in_channels=ch_x32, skip_channels=ch_x16, out_channels=512, dropout_rate=decoder_dropout)
         
-        self.dec2 = DecoderBlock(in_channels=512, skip_channels=ch_x8, out_channels=256)
+        self.dec2 = DecoderBlock(in_channels=512, skip_channels=ch_x8, out_channels=256, dropout_rate=decoder_dropout)
         
-        self.dec3 = DecoderBlock(in_channels=256, skip_channels=ch_x4, out_channels=128)
+        self.dec3 = DecoderBlock(in_channels=256, skip_channels=ch_x4, out_channels=128, dropout_rate=decoder_dropout)
         
-        self.dec4 = DecoderBlock(in_channels=128, skip_channels=ch_x2, out_channels=64)
+        self.dec4 = DecoderBlock(in_channels=128, skip_channels=ch_x2, out_channels=64, dropout_rate=decoder_dropout)
         
+        # Dropout più aggressivo prima della predizione finale per scoraggiare i falsi positivi
+        self.head_dropout = nn.Dropout2d(p=head_dropout)
         # Layer per generare il logit finale della maschera (senza passaggi di sigmoid qui)
         self.head = nn.Conv2d(64, out_channels, kernel_size=1)
 
@@ -403,8 +411,9 @@ class HardNetUNetHead(nn.Module):
             raise RuntimeError("La backbone HarDNet non ha restituito 5 feature map come previsto.")
 
         # U-Net Decoding
-        # 0. Bottleneck
+        # 0. Bottleneck ASPP + dropout
         x32 = self.aspp(x32)
+        x32 = self.aspp_dropout(x32)
 
         # 1. Da x32 (16x16) a x16 (32x32)
         d1 = self.dec1(x32, x16) 
@@ -417,6 +426,9 @@ class HardNetUNetHead(nn.Module):
         
         # 4. Da x4 (128x128) a x2 (256x256)
         d4 = self.dec4(d3, x2)
+        
+        # Dropout prima della predizione finale
+        d4 = self.head_dropout(d4)
         
         # Final logit
         mask_logits = self.head(d4)
