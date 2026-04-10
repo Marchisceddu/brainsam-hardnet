@@ -25,7 +25,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.utils import data
 from monai.losses import DiceLoss, DiceCELoss
 from monai.metrics import DiceMetric
-from models import sam_feat_seg_model_registry, sam_unet_model_registry, sam_unet_cnn_model_registry
+from models import sam_feat_seg_model_registry, sam_unet_model_registry
 from train_dataset import Dataset, parse_volume_info
 from lora_layers import inject_lora_sam
 
@@ -65,8 +65,7 @@ parser.add_argument("--load_saved_model", action='store_true',
                     help='whether freeze encoder of the segmenter')
 parser.add_argument('--model_type', type=str, default="vit_b_hardnet", required=False,
                 help='Model key: vit_b_hardnet, vit_l_hardnet, vit_h_hardnet, '
-                    'vit_b_hardnet_unet, vit_l_hardnet_unet, vit_h_hardnet_unet, '
-                    'vit_b_hardnet_unet_cnn, vit_l_hardnet_unet_cnn, vit_h_hardnet_unet_cnn.')
+                    'vit_b_hardnet_unet, vit_l_hardnet_unet, vit_h_hardnet_unet.')
 parser.add_argument('--input_channels', type=int, default=1, choices=[1, 3],
                     help='Input channels: 1 for grayscale MRI (recommended), 3 for RGB.')
 parser.add_argument('--format_img', type=str, default='.tif', required=False, help='')
@@ -546,7 +545,6 @@ def main_worker(args):
     combined_registry = {
         **sam_feat_seg_model_registry,
         **sam_unet_model_registry,
-        **sam_unet_cnn_model_registry,
     }
     
     if args.model_type not in combined_registry:
