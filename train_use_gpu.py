@@ -133,16 +133,22 @@ parser.add_argument('--use_tensorboard', action='store_true',
                 help='Enable TensorBoard logging (disabled by default to avoid TensorFlow startup warnings).')
 
 # Scheduler parameters
-parser.add_argument('--lr_scheduler', type=str, default='plateau', choices=['step', 'plateau', 'both'],
-                help='Which learning rate scheduler to use (step, plateau, or both).')
+parser.add_argument('--warmup_epochs', type=int, default=5,
+                help='Number of warmup epochs. Set to 0 to disable.')
+parser.add_argument('--warmup_start_lr', type=float, default=1e-6,
+                help='Initial learning rate for the warmup phase.')
+parser.add_argument('--lr_scheduler', type=str, default='poly', choices=['step', 'plateau', 'both', 'poly', 'cosine'],
+                help='Which learning rate scheduler to use (step, plateau, both, poly, or cosine).')
 parser.add_argument('--plateau_patience', type=int, default=3,
                 help='Patience for ReduceLROnPlateau scheduler.')
 parser.add_argument('--plateau_factor', type=float, default=0.5,
                 help='Factor for ReduceLROnPlateau scheduler.')
 
 # Optimizer
-parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw'],
-                help='Which optimizer to use (adam or adamw).')
+parser.add_argument('--optimizer', type=str, default='sgd', choices=['adam', 'adamw', 'sgd'],
+                help='Which optimizer to use (adam, adamw, or sgd).')
+parser.add_argument('--clip_grad', type=float, default=0.0,
+                help='Max norm for gradient clipping. Set to 0.0 to disable.')
 
 # LoRA only for the SAM ViT image encoder.
 parser.add_argument('--lora_vit', action='store_true',
@@ -585,6 +591,14 @@ def main_worker(args):
             lr=args.lr,
             weight_decay=args.weight_decay,
         )
+    elif args.optimizer.lower() == 'sgd':
+        optimizer = torch.optim.SGD(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=args.lr,
+            momentum=0.99,
+            nesterov=True,
+            weight_decay=args.weight_decay,
+        )
     else:
         optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, model.parameters()),
@@ -592,17 +606,29 @@ def main_worker(args):
             weight_decay=args.weight_decay,
         )
     
+    scheduler_step = None
+    scheduler_plateau = None
+    
+    main_epochs = args.epochs - args.warmup_epochs if args.warmup_epochs < args.epochs else args.epochs
+
     if args.lr_scheduler in ['step', 'both']:
         scheduler_step = torch.optim.lr_scheduler.StepLR(optimizer, step_size=8, gamma=0.5)
-    else:
-        scheduler_step = None
         
     if args.lr_scheduler in ['plateau', 'both']:
         scheduler_plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='max', patience=args.plateau_patience, factor=args.plateau_factor
         )
-    else:
-        scheduler_plateau = None
+        
+    if args.lr_scheduler == 'poly':
+        scheduler_step = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda epoch: (1 - epoch / max(1, main_epochs)) ** 0.9
+        )
+        
+    if args.lr_scheduler == 'cosine':
+        scheduler_step = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(1, main_epochs), eta_min=1e-6
+        )
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -923,15 +949,16 @@ def main_worker(args):
                     max_images=max(1, args.wandb_max_images),
                 )
 
-        if scheduler_step is not None:
-            scheduler_step.step()
-        if scheduler_plateau is not None:
-            if has_valid_3d_dsc:
-                scheduler_plateau.step(val_dsc_3d_macro_stage2)
-            else:
-                # If no valid 3D DSC, we don't step the plateau scheduler
-                # for now, as it is configured in 'max' mode for DSC.
-                pass
+        if epoch >= args.warmup_epochs:
+            if scheduler_step is not None:
+                scheduler_step.step()
+            if scheduler_plateau is not None:
+                if has_valid_3d_dsc:
+                    scheduler_plateau.step(val_dsc_3d_macro_stage2)
+                else:
+                    # If no valid 3D DSC, we don't step the plateau scheduler
+                    # for now, as it is configured in 'max' mode for DSC.
+                    pass
 
         # save checkpoint (only rank 0): prioritize 3D DSC when available, else use loss
         is_best_epoch = False
@@ -992,9 +1019,22 @@ def train(train_loader, model, optimizer, epoch, args, writer, device, criterion
 
     optimizer.zero_grad()  # zero once at the start
 
+    iters_per_epoch = len(train_loader)
+    warmup_steps = args.warmup_epochs * iters_per_epoch
+
     for step, batch in enumerate(tqdm(train_loader,
                                       total=len(train_loader),
                                       disable=not is_main_process())):
+        
+        # --- Per-step Linear Warmup ---
+        global_step = epoch * iters_per_epoch + step
+        if args.warmup_epochs > 0 and global_step < warmup_steps:
+            alpha = global_step / max(1, warmup_steps - 1)
+            warmup_lr = args.warmup_start_lr + alpha * (args.lr - args.warmup_start_lr)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = warmup_lr
+        # ------------------------------
+
         img = batch['img'].to(device)
         mask = batch['mask'].to(device, dtype=torch.long).squeeze(dim=1)
 
@@ -1023,7 +1063,8 @@ def train(train_loader, model, optimizer, epoch, args, writer, device, criterion
             loss = loss / accum_steps
             loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        if args.clip_grad > 0.0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.clip_grad)
 
         iou_stage1_sum += iou_score(mask, img_out1_for_loss)
         iou_stage2_sum += iou_score(mask, img_out_for_loss)
