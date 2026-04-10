@@ -20,10 +20,8 @@ from tqdm import tqdm
 from models import (
     sam_feat_seg_model_registry,
     sam_unet_model_registry,
-    sam_unet_cnn_model_registry,
     load_checkpoint_safely,
     load_checkpoint_safely_unet,
-    load_checkpoint_safely_unet_cnn,
 )
 from lora_layers import inject_lora_sam
 
@@ -345,9 +343,6 @@ def build_argparser() -> argparse.ArgumentParser:
             "vit_b_hardnet_unet",
             "vit_l_hardnet_unet",
             "vit_h_hardnet_unet",
-            "vit_b_hardnet_unet_cnn",
-            "vit_l_hardnet_unet_cnn",
-            "vit_h_hardnet_unet_cnn",
         ],
     )
     p.add_argument("--num_classes", type=int, default=2)
@@ -415,10 +410,7 @@ def main(args):
     )
 
     # ── Model setup ──
-    if args.model_type in sam_unet_cnn_model_registry:
-        registry = sam_unet_cnn_model_registry
-        loader_fn = load_checkpoint_safely_unet_cnn
-    elif args.model_type in sam_unet_model_registry:
+    if args.model_type in sam_unet_model_registry:
         registry = sam_unet_model_registry
         loader_fn = load_checkpoint_safely_unet
     elif args.model_type in sam_feat_seg_model_registry:

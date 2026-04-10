@@ -25,7 +25,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.utils import data
 from monai.losses import DiceLoss, DiceCELoss
 from monai.metrics import DiceMetric
-from models import sam_feat_seg_model_registry, sam_unet_model_registry, sam_unet_cnn_model_registry
+from models import sam_feat_seg_model_registry, sam_unet_model_registry
 from train_dataset import Dataset, parse_volume_info
 from lora_layers import inject_lora_sam
 
@@ -540,7 +540,6 @@ def main_worker(args):
     combined_registry = {
         **sam_feat_seg_model_registry,
         **sam_unet_model_registry,
-        **sam_unet_cnn_model_registry,
     }
     
     if args.model_type not in combined_registry:

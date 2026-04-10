@@ -1,4 +1,3 @@
-'''
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -121,13 +120,13 @@ class HardNetUNetHead(nn.Module):
         self.dec1 = DecoderBlock(in_channels=ch_x32, skip_channels=ch_x16, out_channels=512)
         
         # Multi-scale FPN Dense Features projection
-        self.proj_d1 = nn.Conv2d(512, 256, kernel_size=1)
+        # self.proj_d1 = nn.Conv2d(512, 256, kernel_size=1)
         
         self.dec2 = DecoderBlock(in_channels=512, skip_channels=ch_x8, out_channels=256)
-        self.proj_d2 = nn.Conv2d(256, 256, kernel_size=1)
+        # self.proj_d2 = nn.Conv2d(256, 256, kernel_size=1)
         
         self.dec3 = DecoderBlock(in_channels=256, skip_channels=ch_x4, out_channels=128)
-        self.proj_d3 = nn.Conv2d(128, 256, kernel_size=1)
+        # self.proj_d3 = nn.Conv2d(128, 256, kernel_size=1)
         
         self.dec4 = DecoderBlock(in_channels=128, skip_channels=ch_x2, out_channels=64)
         
@@ -168,11 +167,11 @@ class HardNetUNetHead(nn.Module):
         d3 = self.dec3(d2, x4)
         
         # Feature Pyramid fusion for dense features (allineate a d1, cioè 1/16)
-        dense_d1 = self.proj_d1(d1)
-        dense_d2 = F.interpolate(self.proj_d2(d2), size=dense_d1.shape[-2:], mode="bilinear", align_corners=False)
-        dense_d3 = F.interpolate(self.proj_d3(d3), size=dense_d1.shape[-2:], mode="bilinear", align_corners=False)
+        # dense_d1 = self.proj_d1(d1)
+        # dense_d2 = F.interpolate(self.proj_d2(d2), size=dense_d1.shape[-2:], mode="bilinear", align_corners=False)
+        # dense_d3 = F.interpolate(self.proj_d3(d3), size=dense_d1.shape[-2:], mode="bilinear", align_corners=False)
         
-        dense_features = dense_d1 + dense_d2 + dense_d3
+        # dense_features = dense_d1 + dense_d2 + dense_d3
         
         # 4. Da x4 (128x128) a x2 (256x256)
         d4 = self.dec4(d3, x2)
@@ -189,7 +188,7 @@ class HardNetUNetHead(nn.Module):
                 align_corners=False,
             )
 
-        return mask_logits, dense_features
+        return mask_logits, (d1, d2, d3)
 '''
 import torch
 import torch.nn as nn
@@ -443,3 +442,4 @@ class HardNetUNetHead(nn.Module):
             )
 
         return mask_logits, (d1, d2, d3)
+'''
